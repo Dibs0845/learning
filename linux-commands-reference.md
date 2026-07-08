@@ -1992,4 +1992,357 @@ Prevention: per-user process limits — `ulimit -u 4096` / `nproc` limits in `/e
 
 ---
 
+## 27. Conceptual Interview Questions & Answers
+
+### Q1. Explain the Linux boot process, step by step.
+
+1. **BIOS/UEFI** — firmware runs POST (hardware checks), locates the boot device.
+2. **Bootloader (GRUB2)** — loads the selected kernel and initramfs into memory; kernel parameters (e.g., `root=`, `single`) are passed here.
+3. **Kernel** — decompresses itself, initializes hardware drivers, mounts the initramfs (temporary root with just enough drivers to reach the real root filesystem), then mounts the real root FS.
+4. **`init` process (PID 1)** — the kernel starts systemd (modern distros), the ancestor of every other process.
+5. **systemd targets** — units start in dependency order up to the default target (`multi-user.target` for servers, `graphical.target` for desktops).
+
+```bash
+systemd-analyze          # total boot time
+systemd-analyze blame    # slowest units during boot
+journalctl -b            # everything logged this boot
+```
+
+### Q2. What is an inode? What information does it store — and what does it NOT store?
+
+An inode is the on-disk metadata structure for a file: **permissions, owner/group, size, timestamps (atime/mtime/ctime), link count, and pointers to the data blocks**. It does **not** store the filename — names live in *directory entries*, which map `name → inode number`. This is why:
+- Hard links are possible (multiple names → same inode).
+- Renaming is instant (only the directory entry changes).
+- A filesystem can run out of inodes while having free space (`df -i` vs `df -h`) — typically caused by millions of tiny files.
+
+### Q3. Zombie vs. orphan processes — what's the difference, and are zombies harmful?
+
+- **Zombie (`Z` state):** a process that has *exited*, but its parent hasn't called `wait()` to read its exit status. It's just a leftover process-table entry — it consumes no CPU or memory, only a PID slot. You cannot kill a zombie (it's already dead); fix the **parent** (or kill the parent so init/systemd adopts and reaps the zombie).
+- **Orphan:** a *running* process whose parent died. It gets re-parented to PID 1 and continues normally — harmless by design (this is how daemons traditionally detached).
+
+```bash
+ps aux | awk '$8 ~ /Z/'     # find zombies
+ps -o ppid= -p <zombie_pid> # find the negligent parent
+```
+Danger sign: *thousands* of zombies → the parent has a bug (never reaps children) and you'll eventually exhaust the PID space.
+
+### Q4. What's the difference between a process and a thread in Linux?
+
+Both are represented by the same kernel object (`task_struct`) — Linux creates them with the same syscall (`clone()`), differing only in *what is shared*. A **thread** shares the address space (memory), file descriptors, and signal handlers with its siblings; a **process** gets copies (via copy-on-write from `fork()`). Consequences: threads communicate through shared memory (fast, needs locking); processes need IPC (pipes, sockets, shared memory segments) but are isolated — one crashing doesn't corrupt the others.
+
+```bash
+ps -eLf | wc -l              # count all threads system-wide
+cat /proc/<PID>/status | grep Threads
+top -H -p <PID>              # per-thread view of one process
+```
+
+### Q5. Explain file descriptors and what `2>&1` really means.
+
+Every process has a table of open file descriptors — small integers indexing into open files/sockets/pipes. By convention: **0 = stdin, 1 = stdout, 2 = stderr**. Redirection manipulates this table via `dup2()`:
+
+```bash
+cmd > f 2>&1     # 1) fd1 → f     2) fd2 → copy of fd1 (also f)      ✓ both in f
+cmd 2>&1 > f     # 1) fd2 → wherever fd1 points NOW (terminal)  2) fd1 → f
+                 # ✗ stderr still hits the terminal — ORDER MATTERS
+```
+
+Everything is a file: sockets, pipes, devices, even `ls /proc/self/fd` shows your shell's descriptor table. "Too many open files" = the per-process fd limit (`ulimit -n`) is exhausted.
+
+### Q6. What is the difference between `su`, `su -`, `sudo`, and `sudo -i`?
+
+| Command | Identity | Environment |
+|---|---|---|
+| `su alice` | switch user | **keeps your current** env/cwd — half-switched, causes subtle bugs |
+| `su - alice` | switch user | full login: alice's env, PATH, home, cwd |
+| `sudo cmd` | run ONE command as root | your env (filtered by sudoers `env_reset`) |
+| `sudo -i` | root login shell | root's environment, like logging in as root |
+
+`sudo` is preferred over a root password: per-user grants, full audit trail in `auth.log`, no shared secret, fine-grained command allowlists in `/etc/sudoers`.
+
+### Q7. What are runlevels / systemd targets?
+
+Legacy SysV **runlevels** (0 halt, 1 single-user, 3 multi-user, 5 graphical, 6 reboot) are replaced by systemd **targets** — named groups of units:
+
+```bash
+systemctl get-default                     # e.g., multi-user.target
+sudo systemctl set-default graphical.target
+sudo systemctl isolate rescue.target      # like dropping to runlevel 1 (maintenance)
+```
+
+`rescue.target` = single-user with basic services; `emergency.target` = root shell, almost nothing mounted — for fixing a broken `/etc/fstab`.
+
+### Q8. Explain swap. When is swapping fine and when is it a problem?
+
+Swap is disk space used as overflow for RAM. The kernel also *proactively* swaps out long-idle pages to keep more RAM available for page cache — so **used swap by itself is not a problem**. The problem is **active swapping (thrashing)**: constant page-in/page-out because the working set exceeds RAM.
+
+```bash
+free -h                  # swap used — static picture, not alarming alone
+vmstat 1                 # si/so columns — SUSTAINED nonzero = real memory pressure
+sysctl vm.swappiness     # 0–100: kernel's eagerness to swap (default 60;
+                         # databases often set 1–10)
+```
+
+### Q9. What is the sticky bit, setuid, and setgid? Give a real example of each.
+
+- **setuid** (`chmod u+s`): executable runs with the *file owner's* privileges. Example: `/usr/bin/passwd` is root-owned setuid — ordinary users can update `/etc/shadow` through it, in a controlled way.
+- **setgid on a directory** (`chmod g+s`): new files inherit the directory's *group* instead of the creator's primary group. Example: a shared `/srv/projects` dir so every team member's files stay group-accessible.
+- **sticky bit on a directory** (`chmod +t`): users may delete only files they own. Example: `/tmp` (mode 1777) — world-writable, but you can't delete other users' files.
+
+Security note: audit setuid binaries (`find / -perm -4000`) — each one is potential privilege escalation.
+
+### Q10. `/etc/passwd` vs `/etc/shadow` — why two files?
+
+Historically hashes lived in world-readable `/etc/passwd` (many programs need to map UID↔username, so it must stay readable). Offline cracking made that untenable, so hashes moved to root-only `/etc/shadow`, which also carries password-aging fields (last change, max age, expiry). The `x` in a passwd entry means "look in shadow." Verify: `ls -l /etc/shadow` → `-rw-r-----  root shadow`.
+
+### Q11. What happens exactly when you run `kill <PID>`? Why can a process ignore it?
+
+`kill` sends a **signal** (default SIGTERM/15) — an asynchronous notification delivered by the kernel. The process may have installed a **handler** (to clean up and exit gracefully), may **ignore** it, or take the default action (terminate). Two signals can't be caught or ignored: **SIGKILL (9)** and **SIGSTOP (19)** — enforced by the kernel itself. Even SIGKILL fails on a process in uninterruptible sleep (`D` state) until the blocking I/O syscall returns — which is why a process stuck on a dead NFS mount survives `kill -9`.
+
+```bash
+kill -TERM 123   # polite request → handler runs → graceful exit
+kill -KILL 123   # kernel destroys it → no cleanup, no flushing, locks left behind
+```
+
+### Q12. Explain the page cache. Why does `free -h` show almost no free memory on a healthy server?
+
+Linux uses idle RAM to cache recently-read disk blocks (the **page cache**) — free RAM is wasted RAM. This memory is instantly reclaimable when applications need it, which is why the `available` column, not `free`, reflects real capacity. This also explains why the *second* read of a big file is dramatically faster, and why `sync; echo 3 > /proc/sys/vm/drop_caches` (benchmarking only!) makes things slower, not faster.
+
+### Q13. Hard link vs. symlink — what happens to each when the target is deleted?
+
+Deleting a file removes one *name* (directory entry) and decrements the inode's link count; **data is freed only when the count hits zero and no process holds it open**. A **hard link** is a peer name — the file survives deletion of the "original." A **symlink** stores a *path*; deleting the target leaves the symlink **dangling** (points to nothing; `ls` shows it red, opening fails with ENOENT). Find broken symlinks: `find . -xtype l`.
+
+### Q14. What is `/proc`? Give practical examples of using it.
+
+A **virtual filesystem** — files are generated on-the-fly by the kernel, representing live kernel and process state (they occupy no disk).
+
+```bash
+cat /proc/cpuinfo /proc/meminfo      # hardware/memory facts
+cat /proc/loadavg                     # the source of 'uptime' numbers
+ls /proc/1234/fd                      # a process's open file descriptors
+cat /proc/1234/environ | tr '\0' '\n' # its environment variables
+cat /proc/1234/limits                 # its effective ulimits
+readlink /proc/1234/exe               # the actual binary it's running
+cat /proc/sys/net/ipv4/ip_forward     # kernel tunables (sysctl reads here)
+```
+
+Recovery trick: if a running process's binary/log was deleted, `/proc/<PID>/exe` and `/proc/<PID>/fd/N` still reference the data — copy them out before the process exits.
+
+### Q15. What is umask 022 vs 077 — and why don't new files ever get execute permission?
+
+`umask` *subtracts* permission bits from the creation default. Files are created with base `666` (never `777` — the kernel/libc convention deliberately withholds `x` so nothing becomes executable by accident; you must `chmod +x` explicitly). Directories start from `777`.
+
+- `umask 022` → files `644`, dirs `755` (world-readable — typical default)
+- `umask 077` → files `600`, dirs `700` (private — hardened servers, shared boxes)
+
+### Q16. Difference between `apt update`, `apt upgrade`, and `apt dist-upgrade`/`full-upgrade`?
+
+- `update` — refreshes the **package index** only (what versions exist). Changes nothing installed.
+- `upgrade` — installs newer versions of installed packages, but **never removes** packages or installs new dependencies.
+- `full-upgrade` (`dist-upgrade`) — upgrades and **may add/remove** packages to resolve changed dependencies — needed for kernel jumps and release upgrades. Always `update` before either; the index is what makes `upgrade` see anything.
+
+### Q17. How does DNS resolution work on a Linux box, in order?
+
+1. **`nsswitch.conf`** (`hosts:` line) defines the order — typically `files dns`.
+2. **`/etc/hosts`** — static overrides, checked first.
+3. **Stub resolver** sends the query to the nameserver in **`/etc/resolv.conf`** — on modern Ubuntu that's `systemd-resolved` at `127.0.0.53`, which caches and forwards upstream.
+4. Upstream **recursive resolver** walks root → TLD → authoritative servers, caches by TTL.
+
+```bash
+resolvectl status            # what systemd-resolved is actually using
+getent hosts example.com     # resolve the way libc does (respects nsswitch)
+dig example.com              # bypasses nsswitch — talks straight to DNS
+```
+Debug insight: `dig` works but the app fails → the problem is in `/etc/hosts`/nsswitch/resolved, not DNS itself.
+
+### Q18. What are cgroups and namespaces? Why do they matter?
+
+They are the two kernel primitives behind **containers**:
+- **Namespaces** = *isolation of visibility* — separate views of PIDs, mounts, network stacks, hostnames, users. A container's PID 1 is just a normal process in an unshared PID namespace.
+- **cgroups** = *resource limits & accounting* — cap CPU, memory, I/O, and process counts per group; the OOM killer can act per-cgroup.
+
+systemd puts every service in its own cgroup — that's how `MemoryMax=512M` or `TasksMax=` in a unit file works, and how `systemctl status` knows exactly which processes belong to a service. A "container" is nothing more than namespaces + cgroups + a filesystem image — there is no VM involved.
+
+### Q19. Explain exit codes. What do 0, 1, 126, 127, 137 conventionally mean?
+
+| Code | Meaning |
+|---|---|
+| 0 | success (the ONLY success value) |
+| 1 | generic failure |
+| 2 | shell builtin misuse / bad usage |
+| 126 | found but **not executable** (permissions) |
+| 127 | **command not found** (PATH problem) |
+| 128+N | killed by signal N → **137** = 128+9 = SIGKILL (OOM killer's signature!), **143** = 128+15 = SIGTERM |
+
+Seeing exit 137 from a container/CI job almost always means it was OOM-killed — check `dmesg` / cgroup memory limits, not the application logs.
+
+### Q20. `curl` says "connection refused" vs "timeout" — what does each tell you?
+
+- **Connection refused** — the packet *reached* the host, and the kernel answered with TCP RST: **nothing is listening** on that port (service down, wrong port, or listening only on 127.0.0.1). The network path is fine.
+- **Timeout** — packets vanish: a **firewall silently drops** them (security group, iptables DROP), routing is broken, or the host is down.
+
+This single distinction cuts a network triage in half: refused → look at the service and its bind address; timeout → look at firewalls and the path (`tcpdump` to confirm whether packets arrive).
+
+---
+
+## 28. Advanced Scenario-Based Questions
+
+### S13. Every few hours, your Node.js service on a VM restarts by itself. No one is touching it. Find out why.
+
+```bash
+journalctl -u myapp | grep -iE "killed|oom|signal|start"   # restart timeline
+dmesg -T | grep -i "out of memory"                          # kernel OOM kills
+systemctl show myapp -p Restart,RestartSec                  # is systemd auto-restarting?
+```
+Typical finding: `Out of memory: Killed process (node)` in dmesg — a memory leak grows until the OOM killer fires, then `Restart=on-failure` hides the crash by restarting it. Fix the leak (heap snapshots), set `MemoryMax=` in the unit for a cleaner failure mode, and alert on restarts (`systemctl show -p NRestarts`) so "self-healing" doesn't mask real defects.
+
+### S14. A cron job creates files that another service can't read. It works when you run the script manually. Why?
+
+Cron runs with **your user but not your shell environment** — and crucially a possibly different **umask** (cron's default umask is often `022` or `077` depending on distro/PAM config, not your shell's). Manually you create `644` files; cron creates `600`. Fix inside the script — never rely on the caller's environment:
+
+```bash
+#!/usr/bin/env bash
+umask 022                       # explicit
+install -m 644 out.csv /srv/share/   # or set the mode per-file explicitly
+```
+Same reasoning applies to PATH, locale, and env vars — a cron script should be fully self-contained.
+
+### S15. `df -h` says 40% used, but you cannot create files: "No space left on device". Explain and fix.
+
+**Inode exhaustion.** Block space is free but every inode is consumed — classically by millions of tiny files (session files, cache entries, mail queue).
+
+```bash
+df -i                                          # confirm: IUse% = 100%
+for d in /var/*; do echo "$(find "$d" -xdev | wc -l) $d"; done | sort -rn | head
+                                               # find the directory with the file explosion
+find /var/lib/php/sessions -type f -mtime +7 -delete    # purge the culprit
+```
+Long-term: fix the producer (session GC, log cleanup), or rebuild the FS with a higher inode ratio (`mkfs.ext4 -i 4096`) — inode count is fixed at format time on ext4.
+
+### S16. SSH to a server suddenly takes 30 seconds to give you a prompt, then works normally. What do you check?
+
+Classic causes, in order of likelihood:
+1. **Reverse DNS timeout** — sshd tries to resolve your client IP; if the DNS server is unreachable, it waits for timeout. Fix: `UseDNS no` in `sshd_config`.
+2. **GSSAPI negotiation delay** — `GSSAPIAuthentication no` (client or server).
+3. **Full/slow home filesystem** or slow LDAP/NSS lookups for your user (check `nsswitch.conf`, try a local user).
+
+Diagnose from the client with `ssh -vvv host` — the log stalls exactly at the slow step (e.g., stuck after "debug1: SSH2_MSG_SERVICE_ACCEPT" → auth/DNS on server side).
+
+### S17. You edited `/etc/fstab` and now the server won't boot — it drops into emergency mode. Recover.
+
+At the emergency shell (or via console/rescue ISO):
+
+```bash
+journalctl -xb | grep -i mount        # confirm which mount failed
+mount -o remount,rw /                 # emergency mode often mounts / read-only
+vi /etc/fstab                         # fix or comment out the bad line
+mount -a                              # TEST — this is the step people skip
+systemctl daemon-reload && reboot
+```
+Prevention: **always `sudo mount -a` immediately after editing fstab** (it applies fstab without rebooting — errors show up while you can still fix them), and add `nofail` to non-critical mounts so a missing disk degrades instead of blocking boot:
+```text
+UUID=xxxx  /data  ext4  defaults,nofail,x-systemd.device-timeout=5s  0 2
+```
+
+### S18. Two services must talk on localhost:6379, but you see intermittent "Cannot assign requested address" errors under load. What's happening?
+
+**Ephemeral port exhaustion.** Each outbound connection consumes a local port; closed connections linger in TIME_WAIT (~60s). At high connection-per-second rates with no pooling/keep-alive, all ~28k ephemeral ports are in TIME_WAIT.
+
+```bash
+ss -tan state time-wait | wc -l                    # confirm the pileup
+cat /proc/sys/net/ipv4/ip_local_port_range         # default 32768-60999
+sysctl -w net.ipv4.tcp_tw_reuse=1                  # safe mitigation (outbound)
+sysctl -w net.ipv4.ip_local_port_range="15000 65000"   # widen the range
+```
+The *real* fix is architectural: **connection pooling / keep-alive** (one persistent connection instead of thousands of short-lived ones). The sysctls only buy headroom.
+
+### S19. A junior admin ran `chmod -R 777 /` (or `chown -R` on `/`) before stopping it. The system is misbehaving. What now?
+
+Assess honestly: system-wide permission destruction is generally **not repairable in place** — `sudo` stops working (sudoers must be 0440), SSH refuses keys, setuid bits are gone. Immediate steps:
+1. Keep any existing root sessions open (new auth may fail).
+2. Snapshot/backup application data now.
+3. On RPM systems, `rpm --setugids -a && rpm --setperms -a` restores *package-owned* file perms (partial fix); Debian has no full equivalent.
+4. Realistic answer interviewers want: **rebuild the host from configuration management** (Ansible/image), restore data from backup. This is *why* infrastructure-as-code and immutable infrastructure exist — hosts should be replaceable, not archaeologically restored.
+
+### S20. Your web app reports "Permission denied" reading a file, but `ls -l` shows the app user has read permission on the file. What else can block access?
+
+Checklist beyond the file's own mode bits:
+1. **Directory execute (`x`) permission missing** anywhere along the path — you need `x` on *every* ancestor directory to traverse it: `namei -l /var/www/app/config.yml` shows the whole chain.
+2. **SELinux/AppArmor** — `sudo ausearch -m avc -ts recent` (SELinux) or `dmesg | grep apparmor`. Fix context: `restorecon -Rv /var/www/app`. This is *the* classic on RHEL when files were `mv`ed (keeps old context) instead of `cp`ied.
+3. **ACLs** — `getfacl file` may reveal a deny/mask beyond `ls -l` (a `+` at the end of the mode string hints ACLs exist).
+4. **Filesystem mount options** — `noexec`, `ro` on the mount (`findmnt /var/www`).
+5. **systemd sandboxing** — `ProtectSystem=strict`, `ReadOnlyPaths=`, or `PrivateTmp=true` in the unit can deny paths regardless of Unix perms: check `systemctl cat myapp`.
+
+### S21. You need to capture what HTTP requests a misbehaving legacy binary sends — no docs, no source, no logs. How?
+
+```bash
+# 1. Watch its syscalls — see connect() targets and write() payloads
+strace -f -e trace=network -s 200 ./legacy-bin
+
+# 2. Capture the actual traffic
+sudo tcpdump -i any -A 'tcp port 80' -w /tmp/cap.pcap    # -A shows ASCII payloads
+# analyze: tcpdump -r /tmp/cap.pcap -A | less  (or open in Wireshark)
+
+# 3. HTTPS? Intercept with a local proxy
+HTTP_PROXY=http://127.0.0.1:8080 HTTPS_PROXY=http://127.0.0.1:8080 ./legacy-bin
+# with mitmproxy listening — works if the binary honors proxy env vars
+
+# 4. What files/configs does it touch while at it?
+strace -f -e trace=openat ./legacy-bin 2>&1 | grep -v ENOENT
+```
+
+### S22. Root disk hit 100% and even `rm` misbehaves; the box hosts a busy database you must not stop. Get space back safely, in order.
+
+```bash
+# 1. Instant wins — truncate (not rm!) fat logs: frees space even while held open
+: > /var/log/myapp/huge.log          # truncate-in-place, fd stays valid
+journalctl --vacuum-size=200M        # trim the systemd journal
+
+# 2. Package caches — always safe
+apt clean          # or: dnf clean all
+
+# 3. Find the growth (largest dirs, this filesystem only)
+du -x -h --max-depth=2 / 2>/dev/null | sort -hr | head -15
+
+# 4. Deleted-but-open files (safe to reclaim via truncate through /proc)
+lsof +L1 | sort -k7 -rn | head       # link count 0 = deleted, still held
+: > /proc/<PID>/fd/<FD>              # reclaim without touching the process
+
+# 5. Old rotated logs, core dumps, tmp
+find /var/log -name "*.gz" -mtime +14 -delete
+find / -xdev -name "core.*" -size +100M 2>/dev/null
+```
+Never delete: anything under the DB's data directory, files you can't identify, or live logs (`truncate`, don't `rm` — `rm` on a held-open file frees *nothing* and hides the file from `du`, making things more confusing).
+
+### S23. After a reboot, a service starts but can't reach the database — yet restarting it manually fixes it every time. Diagnose.
+
+**Startup ordering race**: the unit starts before the network (or the DB) is actually ready. `After=network.target` only orders against network *infrastructure setup*, not "network is usable."
+
+```ini
+[Unit]
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service         # hard dependency, restart together
+
+[Service]
+Restart=on-failure
+RestartSec=3
+# Belt and braces: make the app itself retry DB connections at startup —
+# ordering fixes the common case; retries fix the distributed-systems case
+# (remote DB, cloud, k8s — no systemd ordering possible there).
+```
+Verify the theory before fixing: `journalctl -u myapp -b` timestamps vs. `journalctl -u postgresql -b` — you'll see the connection attempt land before the DB's "ready to accept connections."
+
+### S24. Explain what you'd check if `sudo` suddenly takes ~25 seconds before prompting for the password.
+
+`sudo` tries to resolve the machine's **own hostname**; if `/etc/hostname` doesn't have a matching entry in `/etc/hosts`, it queries DNS and waits for the timeout.
+
+```bash
+hostname                     # e.g., app-server-01
+grep "$(hostname)" /etc/hosts    # missing? add it:
+echo "127.0.1.1 app-server-01" | sudo tee -a /etc/hosts
+```
+Same root cause family as the slow-SSH scenario (S16) — **name-resolution timeouts masquerading as "the system is slow."** Rule of thumb: any *fixed-length* delay (exactly 5, 10, 25 s) smells like a network timeout, not load.
+
+---
+
 *End of reference — pair this with hands-on practice: every command here is best learned by running it against a throwaway VM or container (`docker run -it ubuntu bash`).*
