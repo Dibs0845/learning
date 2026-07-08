@@ -3,7 +3,7 @@
 > **Principal Engineer · Technical Interview Series**
 > Experience: 7+ years | Target: Senior → Staff → Architect
 > Companies: Amazon · Google · Microsoft · Atlassian · Adobe · Uber · Airbnb · Salesforce · Walmart
-> Questions: 4 / 60+ covered
+> Questions: 9 / 60+ covered
 
 ---
 
