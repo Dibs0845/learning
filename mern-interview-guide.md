@@ -912,6 +912,885 @@ const safeStore = new Map();  // Map has no prototype chain to pollute
 
 ---
 
+## Topic 02 — Node.js
+
+---
+
+### Q19 — Node.js Architecture: Event-Driven Core, libuv, and Scaling Patterns
+
+*Asked at: Amazon · Microsoft · Uber · Walmart*
+
+#### Why Interviewers Ask This
+
+Anyone can `app.listen(3000)`. This question separates candidates who used Node.js from candidates who can explain *why* it scales the way it does, and who can design an architecture that survives a CPU-bound spike or a 10x traffic surge. Amazon and Walmart-scale interviews use this to probe both runtime internals and application-layer architecture in one question.
+
+#### Beginner Answer
+
+> "Node.js is single-threaded and non-blocking, so it can handle many requests at once without creating a thread per request like traditional servers."
+
+**Score: 3 / 10 — True, but says nothing about libuv, the thread pool, or how to actually scale a Node app**
+
+#### Senior Engineer Answer
+
+Node.js is not "single-threaded" in the way people assume — it has **one JS execution thread**, but the runtime itself uses multiple threads under the hood via **libuv**.
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                        Your Application                      │
+│              (routes, controllers, services)                 │
+├─────────────────────────────────────────────────────────────┤
+│   Node.js Bindings (fs, net, http, crypto, dns, ...)         │
+├─────────────────────────────────────────────────────────────┤
+│   V8 Engine            │            libuv                    │
+│   - JS execution       │   - Event loop (single thread)      │
+│   - Heap / GC          │   - Thread pool (default 4 threads) │
+│   - JIT compilation    │   - OS async I/O (epoll/kqueue/IOCP) │
+└─────────────────────────────────────────────────────────────┘
+```
+
+**What actually uses the libuv thread pool vs. OS-level async I/O:**
+
+```text
+Thread pool (UV_THREADPOOL_SIZE, default 4):
+  - fs.* (file system — no native async I/O on all platforms)
+  - crypto.pbkdf2 / scrypt / randomBytes (CPU-heavy)
+  - zlib (compression)
+  - dns.lookup (uses getaddrinfo, NOT dns.resolve which is a direct socket call)
+
+OS-level async I/O (no thread pool needed — epoll/kqueue/IOCP):
+  - net / http / tcp sockets
+  - dns.resolve*
+```
+
+> **Interview trap:** "Is Node single-threaded?" — The correct answer is "the event loop and your JS run on one thread, but libuv uses a thread pool for certain blocking syscalls, and V8's garbage collector also has helper threads."
+
+**Scaling out — three mechanisms, very different trade-offs:**
+
+```javascript
+// 1. Cluster module — multi-PROCESS, shares a port, separate V8 heaps
+const cluster = require('cluster');
+const os = require('os');
+
+if (cluster.isPrimary) {
+  os.cpus().forEach(() => cluster.fork());  // one process per core
+  cluster.on('exit', (worker) => cluster.fork()); // respawn on crash
+} else {
+  require('./server'); // each worker runs the full app
+}
+
+// 2. Worker Threads — multi-THREAD, shares memory via SharedArrayBuffer
+const { Worker } = require('worker_threads');
+const worker = new Worker('./cpu-heavy-task.js', { workerData: largeBuffer });
+worker.on('message', (result) => console.log(result));
+// Use for: image processing, PDF generation, heavy computation — NOT for I/O
+
+// 3. Child Process — separate program entirely, IPC via serialization
+const { spawn } = require('child_process');
+const proc = spawn('ffmpeg', ['-i', 'input.mp4', 'output.mp4']);
+// Use for: shelling out to other binaries/languages
+```
+
+| Mechanism | Isolation | Shares memory? | Best for |
+|---|---|---|---|
+| **Cluster** | Separate process, separate V8 heap | No (IPC via serialization) | Scaling HTTP throughput across cores |
+| **Worker Threads** | Separate V8 isolate, same process | Yes, via `SharedArrayBuffer`/`transferList` | CPU-bound work (hashing, image resize, parsing) |
+| **Child Process** | Fully separate program | No | Running external tools/binaries |
+
+**Layered application architecture (what interviewers expect you to sketch):**
+
+```text
+Request
+  → Router          (path/method matching)
+  → Middleware       (auth, validation, rate-limit)
+  → Controller       (parse request, call service, shape response)
+  → Service          (business logic, orchestration)
+  → Repository/DAO   (data access, ORM/query builder)
+  → Database / Cache / External API
+```
+
+Keeping controllers thin and business logic in services is what makes the app testable — you can unit-test services without spinning up Express.
+
+#### Trade-offs
+
+| Approach | Advantage | Disadvantage |
+|---|---|---|
+| Cluster module | Full CPU utilization, process crash isolation | No shared memory; sticky sessions needed for WebSockets/in-memory sessions |
+| Worker Threads | Shared memory, cheaper than child process | Still bounded by CPU core count; complexity in message passing |
+| Monolith | Simple deploy, easy transactions, low latency between modules | Harder to scale teams/parts independently; one bug can take down everything |
+| Microservices | Independent scaling & deploys, fault isolation | Network latency, distributed transactions, operational overhead (service mesh, tracing) |
+
+#### Common Mistakes
+
+**1. Running CPU-bound work on the main thread:**
+
+```javascript
+// BAD — blocks the event loop for every other request
+app.post('/resize', (req, res) => {
+  const resized = heavySyncImageResize(req.body.image); // blocks 500ms+
+  res.json(resized);
+});
+
+// GOOD — offload to a worker thread or a queue-backed microservice
+app.post('/resize', async (req, res) => {
+  const result = await runInWorker('./resize-worker.js', req.body.image);
+  res.json(result);
+});
+```
+
+**2. Assuming Cluster shares in-memory state:**
+
+```javascript
+// BAG — each cluster worker has its OWN copy of this Map
+const sessions = new Map(); // worker 1's map ≠ worker 2's map
+// A user's request can land on a different worker each time (round-robin)
+// and their session "disappears"
+
+// FIX — externalize shared state to Redis
+const session = await redisClient.get(`session:${userId}`);
+```
+
+**3. Forgetting `UV_THREADPOOL_SIZE` is a shared, fixed resource:**
+
+```javascript
+// If you do 20 concurrent bcrypt.hash() calls, only 4 run at a time by default
+// (bcrypt uses the same libuv thread pool as fs and dns.lookup)
+// Increase pool size for I/O/crypto-heavy apps:
+process.env.UV_THREADPOOL_SIZE = 16; // must be set before any thread-pool op runs
+```
+
+#### Follow-up Questions
+
+1. How does the Cluster module load-balance connections across workers? *(Linux: OS-level round-robin via shared socket (SO_REUSEPORT-like); Node's own round-robin scheduler on other platforms)*
+2. Why can't WebSocket connections be load-balanced across Cluster workers without extra work? *(sticky sessions + a shared pub/sub layer like Redis for socket.io)*
+3. When would you choose Worker Threads over spinning up a separate microservice for CPU-bound work?
+4. How does V8's garbage collector affect a long-running Node process's latency (GC pauses)?
+5. How do you graceful-shutdown a clustered Node app during a deploy? *(SIGTERM handler, drain connections, `server.close()`, health check flips before kill)*
+
+#### Real Production Example
+
+At a Walmart-scale checkout service, a single Node process was handling both API traffic and on-demand PDF invoice generation. Under Black-Friday-level load, PDF generation (CPU-bound, ~300ms per invoice) was blocking the event loop, causing P99 API latency to spike from 50ms to 4000ms and triggering cascading timeouts upstream.
+
+```javascript
+// BEFORE — PDF generation blocks the shared event loop
+app.get('/invoice/:id', async (req, res) => {
+  const pdf = generatePdfSync(order); // 300ms of pure CPU, blocks everything
+  res.type('pdf').send(pdf);
+});
+
+// AFTER — dedicated worker pool + queue, main event loop stays free
+app.get('/invoice/:id', async (req, res) => {
+  const jobId = await pdfQueue.add({ orderId: req.params.id }); // BullMQ + Redis
+  res.json({ jobId, statusUrl: `/invoice/status/${jobId}` });
+});
+// Separate worker process consumes the queue, isolated from API traffic
+```
+
+**Fix applied:** Moved PDF generation to a dedicated worker pool consuming a Redis-backed queue (BullMQ), decoupling it entirely from the request-handling process. P99 API latency returned to 45ms under the same load.
+
+#### Performance Considerations
+
+- Profile with `clinic.js doctor` to spot event-loop-blocking code paths
+- `perf_hooks.monitorEventLoopDelay()` in production — alert if p99 event loop delay > 10ms
+- Increase `UV_THREADPOOL_SIZE` for apps heavy on `fs`/`crypto`/`zlib`, but remember it's a shared, process-wide resource
+- Avoid `JSON.parse`/`JSON.stringify` on very large payloads on the hot path — it's synchronous and O(n) blocking
+
+#### Scalability Considerations
+
+- Keep the app **stateless** — externalize sessions, caches, and rate-limit counters to Redis so any instance can serve any request
+- Run behind a load balancer with health checks (`/healthz`) and graceful shutdown (drain in-flight requests on SIGTERM before exiting)
+- Horizontal scaling (more instances/pods) is almost always preferable to vertical scaling for I/O-bound Node apps — Kubernetes HPA on CPU/latency metrics
+- Use a process manager (PM2 cluster mode, or Kubernetes replicas) rather than hand-rolling `cluster.fork()` logic in most production setups
+
+> **Interviewer Note:** A candidate who distinguishes the thread pool from OS-level async I/O, and who can sketch a layered architecture plus a real scaling fix, is at Senior/Staff level.
+
+---
+
+### Q20 — Express Middleware: Types, Execution Order, and Error Handling
+
+*Asked at: Amazon · Microsoft · Adobe*
+
+#### Why Interviewers Ask This
+
+Middleware is the backbone of every Express (and most Node framework) request lifecycle. Interviewers use this to check whether you understand the request pipeline as a chain of function calls — not magic — and whether you know the single most common cause of hung requests in production: an async middleware that throws without calling `next(err)`.
+
+#### Beginner Answer
+
+> "Middleware are functions that run between the request and the response. You call `next()` to pass control to the next one."
+
+**Score: 3 / 10 — Correct but misses middleware types, ordering rules, and async error handling entirely**
+
+#### Senior Engineer Answer
+
+Express is fundamentally a **chain of functions**, each with the signature `(req, res, next)`. The request flows through the stack in the exact order middleware was registered.
+
+```text
+Request
+   │
+   ▼
+┌─────────────┐   ┌─────────────┐   ┌─────────────┐   ┌─────────────┐
+│  helmet()   │──▶│  cors()     │──▶│ express.json│──▶│  authMw()   │──▶ route handler
+└─────────────┘   └─────────────┘   └─────────────┘   └─────────────┘
+       │                  │                 │                 │
+       ▼                  ▼                 ▼                 ▼
+   sets headers     sets CORS         parses JSON       verifies JWT,
+                    headers           body → req.body    sets req.user
+
+If any middleware calls next(err) instead of next() → jumps straight to
+the error-handling middleware (4-arg signature), skipping everything else.
+```
+
+**Middleware categories:**
+
+```javascript
+// 1. Application-level — runs for every request (or a path prefix)
+app.use(express.json());
+app.use('/api', apiRouter);
+
+// 2. Router-level — scoped to a specific router instance
+const router = express.Router();
+router.use(authMiddleware); // only applies to routes on this router
+
+// 3. Built-in — shipped with Express
+app.use(express.static('public'));
+app.use(express.urlencoded({ extended: true }));
+
+// 4. Third-party
+app.use(helmet());
+app.use(morgan('combined'));
+app.use(cors());
+
+// 5. Error-handling — MUST have exactly 4 params; Express detects this by arity
+app.use((err, req, res, next) => {
+  logger.error(err);
+  res.status(err.statusCode || 500).json({ message: err.message || 'Internal error' });
+});
+```
+
+> **Key mechanism:** Express checks `fn.length` — if a middleware function has exactly 4 parameters, it's registered as error-handling middleware and is skipped during normal flow, only invoked via `next(err)`.
+
+**The async error-handling trap — the #1 Express production bug:**
+
+```javascript
+// BAD — Express 4's error handling does NOT catch rejected promises
+app.get('/user/:id', async (req, res) => {
+  const user = await db.findUser(req.params.id); // throws — findUser rejects
+  res.json(user);
+  // If db.findUser() rejects, this becomes an UNHANDLED REJECTION.
+  // The request hangs forever — no response sent, no error middleware triggered.
+});
+
+// FIX 1 — manual try/catch with next(err)
+app.get('/user/:id', async (req, res, next) => {
+  try {
+    const user = await db.findUser(req.params.id);
+    res.json(user);
+  } catch (err) {
+    next(err); // routes to error middleware
+  }
+});
+
+// FIX 2 — a wrapper utility (avoids repeating try/catch everywhere)
+const asyncHandler = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+app.get('/user/:id', asyncHandler(async (req, res) => {
+  const user = await db.findUser(req.params.id);
+  res.json(user);
+}));
+
+// FIX 3 — Express 5 (2024+) auto-forwards rejected promises to next() natively
+```
+
+**Centralized error handler distinguishing operational vs. programmer errors:**
+
+```javascript
+class AppError extends Error {
+  constructor(message, statusCode) {
+    super(message);
+    this.statusCode = statusCode;
+    this.isOperational = true; // expected error (bad input, not found, etc.)
+  }
+}
+
+app.use((err, req, res, next) => {
+  if (err.isOperational) {
+    return res.status(err.statusCode).json({ message: err.message });
+  }
+  // Unexpected/programmer error — don't leak internals to the client
+  logger.error('UNEXPECTED ERROR', err);
+  res.status(500).json({ message: 'Something went wrong' });
+});
+```
+
+#### Trade-offs
+
+| Approach | Advantage | Disadvantage |
+|---|---|---|
+| Manual try/catch per route | Explicit, no magic | Repetitive boilerplate across dozens of routes |
+| `asyncHandler` wrapper | DRY, consistent error routing | One more abstraction devs must learn/remember to use |
+| Express 5 native async support | Zero boilerplate | Still maturing adoption; many codebases pinned to Express 4 |
+| Fat middleware chains | Reusable cross-cutting concerns | Every added middleware adds latency; hard to trace order-dependent bugs |
+
+#### Common Mistakes
+
+**1. Placing error-handling middleware before routes:**
+
+```javascript
+// BAD — error handler registered before routes never gets reached correctly
+app.use(errorHandler);
+app.use('/api', apiRouter);
+
+// GOOD — error handler must be LAST
+app.use('/api', apiRouter);
+app.use(errorHandler);
+```
+
+**2. Calling `next()` after already sending a response:**
+
+```javascript
+app.get('/data', (req, res, next) => {
+  res.json({ ok: true });
+  next(); // BUG — "Cannot set headers after they are sent to the client"
+});
+```
+
+**3. Forgetting body-parser must run before routes that read `req.body`:**
+
+```javascript
+app.post('/login', (req, res) => {
+  console.log(req.body); // undefined if express.json() wasn't registered first
+});
+app.use(express.json()); // too late — registered AFTER the route
+```
+
+#### Follow-up Questions
+
+1. How does Express decide whether a middleware is error-handling or normal? *(function arity — `fn.length === 4`)*
+2. What happens if you call `next()` twice in the same middleware?
+3. How would you write middleware that only applies to a subset of routes matching a pattern?
+4. How does Express 5 change async error handling compared to Express 4?
+5. How would you implement request-scoped context (e.g., a request ID for logging) using middleware? *(AsyncLocalStorage or attaching to `req`)*
+
+#### Real Production Example
+
+An Adobe-scale API had an async route handler that called an external payment gateway. When the gateway timed out, the promise rejected, but there was no try/catch and no `asyncHandler`. The request never got a response — it hung until the client's own timeout (30s), and the connection stayed open the whole time. Under load, this exhausted the server's available sockets, causing a full outage that looked like "the server is down" when it was actually alive but starved of connections.
+
+**Fix applied:** Wrapped every async route with `asyncHandler`, added a global `unhandledRejection` process listener as a safety net (logs + triggers alerting), and added a request-level timeout middleware (`connect-timeout`) that calls `next(new AppError('Gateway timeout', 504))` if a request exceeds 10s.
+
+#### Performance Considerations
+
+- Every middleware in the chain adds latency — measure with `response-time` middleware and trim unused ones
+- Avoid synchronous, CPU-heavy work inside middleware (e.g., full-payload deep validation with backtracking regex) — see ReDoS in the Security question below
+- Order matters for short-circuiting: put cheap checks (auth token presence) before expensive ones (DB-backed permission checks)
+
+#### Scalability Considerations
+
+- Rate-limiting middleware must use a shared store (Redis) across instances — an in-memory counter only limits requests hitting that one process
+- Centralize cross-cutting middleware (auth, rate limiting, logging) at an API gateway layer when running microservices, to avoid duplicating and drifting logic across services
+- Use `AsyncLocalStorage` (Node 14+) for request-scoped context (trace IDs, tenant IDs) instead of manually threading `req` through every function call
+
+> **Interviewer Note:** A candidate who explains the 4-arg error-middleware detection mechanism and the async rejection trap (with a wrapper fix) is at Senior level.
+
+---
+
+### Q21 — Routing in Express: Matching Internals, Router Composition, and Versioning
+
+*Asked at: Amazon · Google · Uber*
+
+#### Why Interviewers Ask This
+
+Routing looks trivial until an API grows to hundreds of endpoints and a subtle ordering bug makes a route unreachable. This question checks whether you understand route matching order, modular `Router()` composition, and how to structure/version a large API — all real architecture decisions, not just syntax.
+
+#### Beginner Answer
+
+> "You define routes with `app.get()`, `app.post()`, etc., and Express calls the matching handler."
+
+**Score: 3 / 10 — No mention of matching order, Router composition, or versioning strategy**
+
+#### Senior Engineer Answer
+
+Express compiles each registered path into a regular expression (via the `path-to-regexp` library) and tests incoming requests **in registration order, top to bottom** — the first matching layer wins for that step of the chain (middleware can still call `next()` to fall through to the next match).
+
+```javascript
+// Route registration order literally determines match order
+app.get('/users/me', getCurrentUser);     // must come FIRST
+app.get('/users/:id', getUserById);        // this would otherwise "eat" /users/me
+
+// If reversed: a request to GET /users/me matches /users/:id first,
+// with req.params.id === 'me' — wrong handler, likely a DB lookup crash
+```
+
+**`Router()` — modular, mountable mini-applications:**
+
+```javascript
+// routes/users.js
+const router = express.Router();
+router.use(requireAuth);              // scoped to this router only
+router.get('/', listUsers);
+router.get('/:id', getUser);
+router.post('/', createUser);
+module.exports = router;
+
+// app.js
+app.use('/api/v1/users', require('./routes/users'));
+// Inside the router, paths are relative to the mount point
+// GET /api/v1/users/42 → router receives it as GET /42
+```
+
+**Route parameter validation with `router.param()` — DRY param handling:**
+
+```javascript
+router.param('id', async (req, res, next, id) => {
+  if (!mongoose.isValidObjectId(id)) {
+    return next(new AppError('Invalid ID format', 400));
+  }
+  next();
+});
+// Now every route with :id on this router gets validated automatically
+router.get('/:id', getUser);
+router.delete('/:id', deleteUser);
+```
+
+**Versioning strategies — trade-offs matter here:**
+
+```javascript
+// 1. URI versioning — most common, cache-friendly, explicit
+app.use('/api/v1/users', usersV1Router);
+app.use('/api/v2/users', usersV2Router);
+
+// 2. Header versioning — cleaner URLs, harder to test/debug/curl
+app.use('/api/users', (req, res, next) => {
+  req.apiVersion = req.headers['accept-version'] || 'v1';
+  next();
+}, usersRouter);
+
+// 3. Query param versioning — rare, mostly for gradual rollout/testing
+// GET /api/users?version=2
+```
+
+| Strategy | Advantage | Disadvantage |
+|---|---|---|
+| URI (`/v1/...`) | Explicit, cacheable, easy to route at gateway/CDN level | URL "pollution", duplicate route trees over time |
+| Header (`Accept-Version`) | Clean URLs, RESTful purity | Harder to test in browser/curl, invisible in logs/analytics |
+| Query param | Simple for gradual feature rollout | Not idiomatic REST, easy to forget/misuse |
+
+#### Trade-offs
+
+| Approach | Advantage | Disadvantage |
+|---|---|---|
+| Flat route files (`app.get` everywhere) | Simple for tiny APIs | Unmanageable past ~20 routes |
+| `Router()` per resource | Modular, testable, scoped middleware | Requires discipline on mount-point naming |
+| Controller layer separate from routes | Thin routes, testable business logic | One more file/layer to navigate |
+| Regex/wildcard routes | Flexible matching | Hard to read, easy to create unintended overlaps |
+
+#### Common Mistakes
+
+**1. Dynamic route shadowing a static one:**
+
+```javascript
+// BUG — /products/featured never reached
+router.get('/:id', getProduct);
+router.get('/featured', getFeaturedProducts); // unreachable — :id matches "featured" first
+
+// FIX — order static/specific routes before dynamic ones
+router.get('/featured', getFeaturedProducts);
+router.get('/:id', getProduct);
+```
+
+**2. Not validating `:id` before hitting the database:**
+
+```javascript
+// BUG — a non-numeric/invalid id crashes the query or returns a confusing 500
+router.get('/:id', async (req, res) => {
+  const user = await db.query('SELECT * FROM users WHERE id = ?', [req.params.id]);
+});
+// FIX — validate format (see router.param example above) and return 400 early
+```
+
+**3. Forgetting router-level middleware only applies to routes registered *after* it:**
+
+```javascript
+router.get('/public', publicHandler);   // NOT protected
+router.use(requireAuth);                // applies only below this line
+router.get('/private', privateHandler); // protected
+```
+
+#### Follow-up Questions
+
+1. How does `path-to-regexp` turn `/users/:id` into a regular expression, and how do optional (`:id?`) and wildcard (`*`) params affect it?
+2. How would you implement API versioning that lets you deprecate v1 gradually while both versions run simultaneously?
+3. How do you unit-test a Router in isolation without booting the full Express app? *(supertest against just that router mounted on a fresh `express()` instance)*
+4. What's the performance impact of having thousands of registered routes, and how would you mitigate it? *(nested routers by prefix reduce regex tests per request)*
+5. How would you implement route-level rate limiting different from the global rate limit?
+
+#### Real Production Example
+
+At a Google-Cloud-adjacent internal tool, a new engineer added `GET /reports/:reportId` to fetch a report by ID. Two days later, the existing `GET /reports/summary` endpoint (aggregated dashboard data) started returning 500s intermittently. Root cause: the new dynamic route was registered *before* the existing static route, so requests to `/reports/summary` matched `:reportId = "summary"`, which then failed a DB lookup expecting a UUID.
+
+**Fix applied:** Reordered static routes above dynamic ones, added an integration test asserting `/reports/summary` returns the aggregate shape (not a 404/500), and added a lightweight lint script that flags any router where a `:param` route is registered before a static sibling path.
+
+#### Performance Considerations
+
+- Group routes under `Router()` by resource/prefix so Express can short-circuit non-matching prefixes early rather than testing every route's full regex
+- Avoid excessively broad wildcard routes (`app.use('*', ...)`) high in the middleware stack — every request pays the regex-test cost
+- Cache compiled route regexes are already handled internally by Express — the main cost you control is *how many* routes/middleware a request must traverse before matching
+
+#### Scalability Considerations
+
+- At API-gateway scale, route versioning and deprecation policy should be centrally documented and enforced (e.g., sunset headers, deprecation warnings in response headers)
+- Split large monolithic route trees into per-domain Routers owned by different teams, composed at the top level — mirrors a "modular monolith" that can later be extracted into microservices with minimal rewrite
+- For very high route counts (1000s), consider a radix-tree-based router (e.g., `find-my-way`, used by Fastify) which offers better asymptotic matching performance than Express's linear middleware-stack scan
+
+> **Interviewer Note:** A candidate who catches the static-vs-dynamic route ordering bug from a real scenario and can articulate URI vs. header versioning trade-offs is at Senior level.
+
+---
+
+### Q22 — CORS: Same-Origin Policy, Preflight Requests, and Secure Configuration
+
+*Asked at: Amazon · Microsoft · Salesforce*
+
+#### Why Interviewers Ask This
+
+CORS misconfiguration is one of the most common real-world security bugs in Node/Express APIs, and most developers "fix" CORS errors by copy-pasting `app.use(cors())` without understanding what they just disabled. This question checks whether you understand CORS as a **browser-enforced** protocol (not a server-side security boundary) and whether you can spot a dangerous configuration.
+
+#### Beginner Answer
+
+> "CORS is a browser restriction on calling APIs from a different domain. You fix CORS errors by adding the `cors` npm package and setting `Access-Control-Allow-Origin`."
+
+**Score: 3 / 10 — True but shallow; doesn't explain preflight, credentials, or the actual security implications**
+
+#### Senior Engineer Answer
+
+**Same-Origin Policy (SOP)** is a browser security mechanism: a script running on `https://a.com` cannot read the response of a request to `https://b.com` unless `b.com` explicitly opts in via CORS headers. Two origins match only if scheme, host, **and** port are all identical.
+
+> **Critical nuance interviewers listen for:** CORS does not stop the request from reaching the server (except when a preflight fails). The server still executes a simple GET/POST — CORS only controls whether the **browser hands the response back to the calling JavaScript**. This is why CORS is not a defense against CSRF, and why you'll see the request succeed server-side (e.g., in your logs/DB) even though the browser console shows a CORS error.
+
+**Simple requests vs. preflighted requests:**
+
+```text
+SIMPLE request (no preflight) — sent directly:
+  - Method: GET, HEAD, or POST
+  - Only "CORS-safelisted" headers (Accept, Accept-Language, Content-Type)
+  - Content-Type limited to: application/x-www-form-urlencoded,
+    multipart/form-data, or text/plain
+
+PREFLIGHTED request — browser sends an OPTIONS request FIRST:
+  - Method: PUT, DELETE, PATCH, or custom methods
+  - Custom headers (Authorization, X-Custom-Header)
+  - Content-Type: application/json  ← this alone triggers preflight!
+```
+
+```text
+Preflight flow:
+
+Browser                                Server
+   │  OPTIONS /api/users                  │
+   │  Origin: https://app.example.com     │
+   │  Access-Control-Request-Method: PUT  │
+   │  Access-Control-Request-Headers:     │
+   │    content-type, authorization       │
+   │─────────────────────────────────────▶│
+   │                                       │
+   │  200 OK                              │
+   │  Access-Control-Allow-Origin:        │
+   │    https://app.example.com           │
+   │  Access-Control-Allow-Methods:       │
+   │    GET, POST, PUT, DELETE            │
+   │  Access-Control-Allow-Headers:       │
+   │    content-type, authorization       │
+   │  Access-Control-Max-Age: 86400       │
+   │◀─────────────────────────────────────│
+   │                                       │
+   │  PUT /api/users/42  (actual request)│
+   │─────────────────────────────────────▶│
+```
+
+**Credentials (cookies, Authorization headers) require explicit configuration:**
+
+```javascript
+const cors = require('cors');
+
+// SAFE — explicit origin allowlist, required when using credentials
+const allowedOrigins = ['https://app.example.com', 'https://admin.example.com'];
+
+app.use(cors({
+  origin: (origin, callback) => {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error('Not allowed by CORS'));
+    }
+  },
+  credentials: true,           // allows cookies/Authorization header
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  maxAge: 86400,                // cache preflight for 24h — fewer OPTIONS round-trips
+}));
+
+// NOTE: Access-Control-Allow-Origin CANNOT be '*' when credentials: true —
+// the browser will reject the response outright. Must be an explicit origin.
+```
+
+#### Trade-offs
+
+| Approach | Advantage | Disadvantage |
+|---|---|---|
+| Wildcard `origin: '*'` | Zero config, works for any client | Cannot be combined with credentials; exposes API to any website's JS |
+| Explicit allowlist | Secure, precise control | Must maintain the list; breaks for legitimate new clients until added |
+| Reflect any origin (`origin: true`) | "Just works" for every caller | Functionally equivalent to `*` but also works WITH credentials — dangerous |
+| CORS at API gateway/proxy | Single source of truth across microservices | Extra hop to reason about; must stay in sync with backend auth model |
+
+#### Common Mistakes
+
+**1. Reflecting the request's Origin header with credentials enabled — a real vulnerability:**
+
+```javascript
+// DANGEROUS — this "reflects" whatever Origin the browser sends, effectively
+// disabling the same-origin protection while still allowing cookies
+app.use(cors({
+  origin: (origin, cb) => cb(null, origin), // accepts ANY origin
+  credentials: true,
+}));
+// An attacker's site (evil.com) can now do:
+// fetch('https://api.example.com/me', { credentials: 'include' })
+// and READ the authenticated response — full account takeover potential
+```
+
+**2. Forgetting `Vary: Origin` when caching responses (CDN/reverse proxy):**
+
+```javascript
+// Without Vary: Origin, a CDN might cache the CORS headers computed for
+// origin A's request and serve them to origin B — leaking access
+res.setHeader('Vary', 'Origin'); // cors middleware sets this automatically
+```
+
+**3. Believing CORS protects against CSRF:**
+
+```text
+CORS controls whether JS can READ a cross-origin response.
+It does NOT stop a <form> POST or an <img src> GET-with-side-effects —
+those aren't subject to CORS at all (no JS reads the response).
+CSRF defense = SameSite cookies + CSRF tokens, NOT CORS headers.
+```
+
+#### Follow-up Questions
+
+1. Why can't you use `Access-Control-Allow-Origin: *` together with `Access-Control-Allow-Credentials: true`?
+2. What triggers a preflight request versus a simple request — list the exact conditions.
+3. How does `Access-Control-Max-Age` interact with browser-enforced caps (Chrome caps it at 2 hours regardless of the header value)?
+4. Why is CORS not a CSRF defense, and what actually prevents CSRF?
+5. How would you configure CORS differently for a public read-only API versus an authenticated internal API?
+
+#### Real Production Example
+
+A Salesforce-scale internal admin dashboard used cookie-based session auth and had CORS configured as `cors({ origin: true, credentials: true })` "to unblock the frontend team quickly." A security audit found that any external website could craft a page with `fetch('https://internal-api.company.com/admin/users', { credentials: 'include' })`, and because the API reflected any Origin while allowing credentials, the attacker's page could read the full response — a cross-site data exfiltration vulnerability affecting any logged-in admin who visited the malicious page.
+
+**Fix applied:** Replaced the reflect-any-origin config with an explicit allowlist of the two legitimate frontend origins, added `SameSite=Strict` to session cookies as defense-in-depth, and added a CSP header restricting which origins the admin dashboard's own pages could load scripts from.
+
+#### Performance Considerations
+
+- Set `Access-Control-Max-Age` to cache preflight responses and avoid a round-trip OPTIONS request before every PUT/DELETE/JSON POST
+- Terminate CORS handling at the reverse proxy/API gateway layer for microservices to avoid every service repeating the same preflight logic
+- Ensure caching layers (CDN, `Cache-Control`) include `Vary: Origin` so cached CORS headers aren't leaked across different calling origins
+
+#### Scalability Considerations
+
+- Centralize the origin allowlist as configuration (env var/config service), not hardcoded — new frontend deployments (staging, preview URLs) shouldn't require a code change and redeploy
+- For multi-tenant SaaS with customer-specific subdomains, validate origins against a pattern/allowlist stored per-tenant rather than a single global list
+- Document CORS policy alongside API versioning — changing allowed methods/headers is a breaking change for existing clients
+
+> **Interviewer Note:** A candidate who explains that CORS is browser-enforced (not a server security boundary), catches the reflect-origin-with-credentials vulnerability, and correctly states CORS ≠ CSRF protection is operating at Senior/Staff level.
+
+---
+
+### Q23 — Node.js / API Security: Injection, JWT Pitfalls, Rate Limiting, and Hardening Checklist
+
+*Asked at: Amazon · Microsoft · Uber · Salesforce*
+
+#### Why Interviewers Ask This
+
+Security questions separate candidates who ship features from candidates who are trusted to own a production API. This is typically asked as an open-ended "how would you secure this Node/Express API" — interviewers are grading breadth (do you know the categories of risk) and depth (can you show the actual vulnerable code and the fix) simultaneously.
+
+#### Beginner Answer
+
+> "I'd use HTTPS, validate user input, and add the `helmet` package for security headers."
+
+**Score: 3 / 10 — All true, but far too shallow for a senior security discussion; no mention of injection classes, JWT pitfalls, or rate limiting**
+
+#### Senior Engineer Answer
+
+A senior answer walks through a **checklist with concrete vulnerable/fixed code** for each category:
+
+**1. Security headers (`helmet`):**
+
+```javascript
+const helmet = require('helmet');
+app.use(helmet()); // sets HSTS, X-Content-Type-Options, X-Frame-Options, etc. by default
+app.use(helmet.contentSecurityPolicy({
+  directives: { defaultSrc: ["'self'"], scriptSrc: ["'self'"] },
+}));
+```
+
+**2. NoSQL injection (MongoDB operator injection) — very common, very missed:**
+
+```javascript
+// VULNERABLE — attacker sends { "password": { "$ne": null } } as JSON body
+app.post('/login', async (req, res) => {
+  const user = await User.findOne({
+    email: req.body.email,
+    password: req.body.password, // if this is an object, Mongo treats it as an operator query!
+  });
+  // { "$ne": null } matches ANY password that is not null — auth bypass
+});
+
+// FIXED — sanitize + enforce types with a schema validator
+const mongoSanitize = require('express-mongo-sanitize');
+app.use(mongoSanitize()); // strips keys starting with '$' or containing '.'
+
+const { z } = require('zod');
+const loginSchema = z.object({ email: z.string().email(), password: z.string().min(8) });
+app.post('/login', async (req, res) => {
+  const { email, password } = loginSchema.parse(req.body); // throws if not plain strings
+  const user = await User.findOne({ email });
+  const valid = user && await bcrypt.compare(password, user.passwordHash);
+});
+```
+
+**3. SQL injection — always parameterize, never concatenate:**
+
+```javascript
+// VULNERABLE
+db.query(`SELECT * FROM users WHERE email = '${req.body.email}'`);
+
+// FIXED — parameterized query
+db.query('SELECT * FROM users WHERE email = ?', [req.body.email]);
+```
+
+**4. Command injection — never pass user input to a shell:**
+
+```javascript
+// VULNERABLE — attacker sends filename = "a.txt; rm -rf /"
+const { exec } = require('child_process');
+exec(`convert ${req.body.filename} output.png`); // shell interprets ; and &&
+
+// FIXED — execFile/spawn with an args array, no shell interpretation
+const { execFile } = require('child_process');
+execFile('convert', [req.body.filename, 'output.png']);
+```
+
+**5. JWT pitfalls:**
+
+```javascript
+// VULNERABLE — "alg: none" / algorithm confusion attack
+jwt.verify(token, secret); // no algorithms restriction — attacker can craft alg:none token
+
+// FIXED — explicitly restrict accepted algorithms
+jwt.verify(token, secret, { algorithms: ['HS256'] });
+
+// Storage: prefer httpOnly, Secure, SameSite cookies over localStorage
+// localStorage is readable by any injected script (XSS) — httpOnly cookies are not
+res.cookie('token', jwt, { httpOnly: true, secure: true, sameSite: 'strict' });
+
+// Short-lived access token (~15 min) + refresh token pattern, with the
+// refresh token stored server-side (or rotated) so it can be revoked
+```
+
+**6. Rate limiting / brute-force protection (must be shared across instances):**
+
+```javascript
+const rateLimit = require('express-rate-limit');
+const RedisStore = require('rate-limit-redis');
+
+app.use('/login', rateLimit({
+  store: new RedisStore({ client: redisClient }), // shared across all instances
+  windowMs: 15 * 60 * 1000,
+  max: 5, // 5 attempts per 15 min per IP
+  message: 'Too many login attempts, try again later',
+}));
+```
+
+**7. ReDoS (Regular Expression Denial of Service):**
+
+```javascript
+// VULNERABLE — catastrophic backtracking on crafted input like "aaaaaaaaaaaaaaaaaaaaaaaaa!"
+const regex = /^(a+)+$/;
+if (regex.test(userInput)) { ... } // can hang the event loop for minutes
+
+// FIXED — avoid nested quantifiers; use a vetted library (safe-regex) to lint patterns,
+// or set an execution timeout via a worker thread for untrusted regex evaluation
+```
+
+**8. Dependency/supply-chain security:**
+
+```bash
+npm audit --production          # check for known CVEs in dependencies
+npm ci                          # install exactly from lockfile, no surprise upgrades
+# Use Dependabot/Snyk for automated PRs on vulnerable dependencies
+# Avoid installing packages with postinstall scripts you haven't reviewed
+```
+
+#### Trade-offs
+
+| Control | Advantage | Disadvantage |
+|---|---|---|
+| Schema validation (Zod/Joi) on every input | Rejects malformed/malicious payloads at the boundary | Upfront cost to define schemas for every endpoint |
+| httpOnly cookies for JWT | Immune to XSS token theft | Vulnerable to CSRF unless paired with SameSite/CSRF tokens |
+| Redis-backed rate limiting | Consistent across all instances | Adds a dependency + latency (~1ms) per request |
+| Strict CSP headers | Strong XSS mitigation | Can break third-party scripts/widgets if not carefully scoped |
+
+#### Common Mistakes
+
+**1. Trusting the shape of `req.body` without validation:**
+
+```javascript
+// Any field could be an object, array, or unexpected type — always validate types
+if (req.body.password === storedPassword) { ... } // breaks if password is an object
+```
+
+**2. Logging sensitive data:**
+
+```javascript
+// BAD — passwords/tokens end up in log aggregators, visible to anyone with log access
+logger.info(`Login attempt: ${JSON.stringify(req.body)}`);
+// FIX — redact sensitive fields before logging
+```
+
+**3. Leaking stack traces in production error responses:**
+
+```javascript
+// BAD
+app.use((err, req, res, next) => res.status(500).json({ stack: err.stack }));
+// FIX — generic message in prod, full detail only in server-side logs
+res.status(500).json({ message: process.env.NODE_ENV === 'production' ? 'Internal error' : err.message });
+```
+
+#### Follow-up Questions
+
+1. How does algorithm confusion (RS256 → HS256) work as a JWT attack, and how do you prevent it?
+2. Why is `express-mongo-sanitize` not sufficient on its own — what else should accompany it? *(schema validation, principle of least privilege on DB user)*
+3. How would you implement token revocation for a stateless JWT-based auth system?
+4. What's the difference between authentication and authorization vulnerabilities — give an example of each in an Express app (broken auth vs. IDOR/broken object-level authorization).
+5. How would you defend against a ReDoS attack on a public-facing search endpoint?
+
+#### Real Production Example
+
+A Uber-scale internal service accepted login payloads and queried MongoDB directly with `req.body` fields without sanitization or schema validation. A penetration test found that sending `{ "email": "admin@company.com", "password": { "$gt": "" } }` bypassed authentication entirely — `$gt: ""` matches any non-empty string, so the query matched the admin's document regardless of the actual password.
+
+**Fix applied:** Added `express-mongo-sanitize` globally to strip `$`-prefixed keys, added Zod schema validation on every auth endpoint enforcing `password` must be a string, and added an automated security regression test suite (`npm audit` + custom injection payloads) run in CI on every PR touching auth code.
+
+#### Performance Considerations
+
+- Schema validation (Zod/Joi) adds microseconds per request — negligible compared to the cost of a successful injection attack
+- Redis-backed rate limiting adds ~1ms latency per request but is required for correctness across multiple instances — an in-memory-only limiter is trivially bypassed by hitting a different instance
+- `bcrypt`/`argon2` password hashing is intentionally slow (by design, to resist brute force) — always run it via the libuv thread pool (default, non-blocking) rather than a sync variant on the main thread
+
+#### Scalability Considerations
+
+- Push common security controls (rate limiting, WAF rules, TLS termination) to an API gateway/reverse proxy shared across all microservices, so every new service inherits baseline protection
+- Rotate secrets (JWT signing keys, DB credentials) via a secrets manager (AWS Secrets Manager/Vault) with zero-downtime rotation support, not hardcoded env vars checked into config
+- As the system grows to multiple services, adopt short-lived, narrowly-scoped service-to-service tokens (mTLS or signed JWTs with tight audience claims) instead of one shared API key everywhere — limits blast radius of any single leaked credential
+
+> **Interviewer Note:** A candidate who can produce vulnerable-code-then-fix pairs for at least three injection classes (NoSQL, SQL, command) plus a coherent JWT security model is at Senior/Staff level. Mentioning ReDoS and ties back to event-loop blocking (Q1) shows Principal-level systems thinking.
+
+---
+
 ## Upcoming Questions
 
 ### JavaScript
@@ -946,17 +1825,19 @@ const safeStore = new Map();  // Map has no prototype chain to pollute
 
 ### Node.js
 
-- Event Loop (Node)
-- Streams
-- Clustering
-- Memory Leaks
+**Covered:** Architecture & Scaling (Q19) · Middleware (Q20) · Routing (Q21) · CORS (Q22) · Security (Q23)
+
+Still upcoming:
+- Streams (Readable/Writable/Duplex/Transform, backpressure)
+- Memory Leaks (heap snapshots, common leak patterns, `--inspect`)
+- Deep dive: Cluster vs. PM2 vs. Kubernetes horizontal scaling in practice
 
 ### Express / MongoDB
 
-- Middleware
 - Indexing
 - Aggregation
 - Sharding
+- Mongoose Schema Design & Transactions
 
 ### System Design
 
