@@ -843,6 +843,90 @@ Create `app/product/[id]/page.js` (or `pages/product/[id].js`). In the Pages Rou
 ### S33. "Client-side navigation feels like a full reload. What am I doing wrong?"
 You're probably using a plain `<a href>` instead of Next's **`<Link>`** component (or `router.push`). `<Link>` does client-side navigation without a full page reload.
 
+## More React Scenarios
+
+### S34. "After deploying, users see a stale version of my app until a hard refresh. What's going on?"
+The browser (or a service worker/CDN) is serving **cached JS/HTML**. Fix with content-hashed filenames (bundlers do this by default), correct cache-control headers on `index.html` (don't long-cache it), and if you use a service worker, add a proper update/skip-waiting flow.
+
+### S35. "My modal renders but appears clipped behind other content / inside an overflow:hidden parent. How do I fix it in React?"
+Render it outside the parent's DOM hierarchy using a **Portal** (`ReactDOM.createPortal`). The modal stays in your component tree logically but mounts to `document.body`, escaping `overflow`/`z-index` stacking contexts.
+
+### S36. "I need to run some code only once, but in StrictMode my effect runs twice in development. Is that a bug?"
+No — React 18 **StrictMode intentionally double-invokes effects in dev** to surface missing cleanup. It doesn't happen in production. The real fix is to make the effect idempotent and add proper cleanup, not to suppress the double-run.
+
+### S37. "A parent passes a callback to a memoized child, but the child still re-renders every time. Why?"
+The callback is a **new function reference** on each parent render, so `React.memo`'s shallow prop check fails. Wrap it in `useCallback` with correct dependencies so the reference stays stable.
+
+### S38. "I store a derived value (e.g., fullName) in state and it keeps going out of sync. What's the better approach?"
+Don't store derived data in state — **compute it during render** from the source state. Storing it duplicates the source of truth and invites sync bugs. Use `useMemo` only if the computation is expensive.
+```jsx
+const fullName = `${first} ${last}`; // derive, don't store
+```
+
+### S39. "My `onScroll`/`onResize` handler fires hundreds of times and janks the UI. How do you handle it?"
+**Throttle** (limit to once per interval) for scroll/resize, or **debounce** (wait until it stops) for search input. Store the timer in a ref and clean it up on unmount.
+
+### S40. "A user double-clicks 'Submit' and it creates two records. How do you prevent it in React?"
+Disable the button and track a `submitting` flag while the request is in flight; re-enable on completion. For robustness, also make the operation idempotent server-side.
+```jsx
+<button disabled={submitting} onClick={handleSubmit}>Submit</button>
+```
+
+### S41. "How would you implement infinite scroll?"
+Observe a sentinel element at the list's bottom with `IntersectionObserver` (via a ref + effect); when it becomes visible, load the next page and append. A data library like React Query has `useInfiniteQuery` for this.
+
+### S42. "My animation/counter using setInterval inside useEffect drifts or uses stale state. Why?"
+The interval callback closed over an old state value. Use the **functional updater** inside the interval, and make sure the effect's dependencies/cleanup are correct so you don't stack multiple intervals.
+```jsx
+useEffect(() => {
+  const id = setInterval(() => setCount(c => c + 1), 1000);
+  return () => clearInterval(id);
+}, []);
+```
+
+### S43. "I need to persist form state across page refreshes. How?"
+Sync state to `localStorage` in an effect and initialize state from it (lazily). Guard against SSR where `window` is undefined.
+```jsx
+const [val, setVal] = useState(() =>
+  typeof window !== 'undefined' ? localStorage.getItem('k') ?? '' : '');
+useEffect(() => { localStorage.setItem('k', val); }, [val]);
+```
+
+### S44. "Two rapid API calls return out of order and the UI shows the wrong (older) result. How do you fix this race?"
+Track the latest request and ignore stale responses — using an `AbortController` to cancel the previous request, or a flag/id captured in the effect closure so only the newest response updates state.
+
+## More Next.js Scenarios
+
+### S45. "My data updated in the database, but the Next.js page still shows the old data. Why?"
+The `fetch` result is **cached** by default. Either set `cache: 'no-store'` (always fresh), add `next: { revalidate: N }`, or after a mutation call `revalidatePath('/route')` / `revalidateTag()` to invalidate the cache.
+
+### S46. "I get 'window is not defined' during build/SSR. What's wrong and how do I fix it?"
+Browser-only APIs (`window`, `document`, `localStorage`) don't exist on the server. Access them inside `useEffect` (client-only), guard with `typeof window !== 'undefined'`, or dynamically import the component with `{ ssr: false }`.
+
+### S47. "I need to protect a group of routes behind authentication. Where's the cleanest place?"
+Check the auth cookie/token in **`middleware.js`** and redirect unauthenticated users before the page renders. For per-page checks in the App Router, you can also verify the session inside the Server Component/layout and redirect.
+
+### S48. "My blog with thousands of posts takes forever to build with SSG. How do you handle that?"
+Don't pre-render everything. Pre-render the popular paths via `generateStaticParams`/`getStaticPaths` and use **`fallback: 'blocking'`** (or ISR) so the rest are generated on-demand at first request and then cached.
+
+### S49. "How would you add real-time data (like a live feed) to a Next.js page?"
+Render the initial shell/data on the server, then subscribe on the client (a Client Component) using WebSockets/SSE or polling with React Query. Server Components can't hold live connections — the live part must be client-side.
+
+### S50. "One slow API call blocks my whole App Router page from showing. How do I improve perceived performance?"
+Use **streaming with Suspense**: wrap the slow section in `<Suspense fallback={...}>` (or split it into a component with its own `loading.js`) so the fast parts render immediately while the slow part streams in.
+
+### S51. "I set a cookie in a Server Component and got an error. Why?"
+You can only **read** cookies during render; **setting** cookies/headers must happen in a Server Action, Route Handler, or middleware — places that run in a mutation/response context, not during passive rendering.
+
+### S52. "My environment variable is `undefined` in the browser. What did I miss?"
+Only variables prefixed with **`NEXT_PUBLIC_`** are exposed to the client bundle. Unprefixed vars are server-only by design. If the value is a secret, keep it server-only; if it's genuinely public, add the prefix and rebuild.
+
+### S53. "How do you handle a 404 for a product that doesn't exist in a dynamic route?"
+In the App Router, call **`notFound()`** from `next/navigation` inside the Server Component when the record is missing — it renders your `not-found.js`. In the Pages Router, return `{ notFound: true }` from `getStaticProps`/`getServerSideProps`.
+
+### S54. "SEO tags (title/description) differ per dynamic page. How do you set them?"
+Export **`generateMetadata`** (App Router) to build metadata from the fetched data per route, or use the `metadata` object for static pages. In the Pages Router, use `next/head` with values from props.
+
 ---
 
 # TRADE-OFF QUESTIONS
@@ -955,6 +1039,64 @@ These test judgment: there's no single "right" answer — you must weigh pros an
 - **Self-host** (Node/Docker): full control, cost predictability. **Cost:** you manage scaling, caching, edge, and CI yourself.
 
 **How I'd answer:** I'd pick **Vercel** for speed-to-ship and first-class Next.js features like ISR and preview deploys, accepting some vendor lock-in and scale pricing as the cost. I'd **self-host** on Node/Docker when I have specific infra or compliance requirements or cost constraints at scale — trading the zero-config convenience for full control.
+
+## More React Trade-offs
+
+### T17. REST vs GraphQL for a React app's data layer
+- **REST**: simple, cacheable, everyone knows it. **Cost:** over-/under-fetching, multiple round-trips for related data.
+- **GraphQL**: fetch exactly what you need in one request, strong typing. **Cost:** server complexity, caching is harder, potential for expensive queries.
+
+**How I'd answer:** I'd pick **REST** for simple apps or when I control both ends and the endpoints map cleanly to screens — accepting occasional over-fetching as a fair price for its simplicity and HTTP caching. I'd choose **GraphQL** when the UI needs many related resources or varied shapes per screen, and I'm willing to take on the server and caching complexity to eliminate round-trips.
+
+### T18. Monorepo vs Multi-repo for a React/Next.js codebase
+- **Monorepo**: shared code, atomic cross-package changes, one toolchain. **Cost:** heavier tooling (Turborepo/Nx), longer CI, more coordination.
+- **Multi-repo**: isolated, independently deployable, smaller mental scope. **Cost:** code duplication, version-syncing pain across shared packages.
+
+**How I'd answer:** I'd use a **monorepo** when teams share components/utilities and I want atomic changes across app + packages, accepting the tooling investment. I'd keep **separate repos** when projects are truly independent and owned by different teams — trading shared-code convenience for isolation and simpler CI.
+
+### T19. Client-side routing (react-router) vs framework routing (Next.js)
+- **react-router**: full control, works in any SPA, flexible. **Cost:** manual setup, no SSR/SEO by default, you wire code-splitting yourself.
+- **Next.js file routing**: zero-config, SSR/SSG per route, built-in splitting. **Cost:** convention-bound, tied to the framework.
+
+**How I'd answer:** I'd reach for **react-router** in a standalone client-only SPA where I want routing freedom and don't need SSR, accepting the manual wiring. I'd pick **Next.js file-based routing** when I want SSR/SEO and convention-over-configuration, and I'm happy to trade flexibility for that built-in structure.
+
+### T20. Writing your own hook vs pulling in a library
+- **Own hook**: no dependency, tailored exactly, full control. **Cost:** you own edge cases, testing, and maintenance.
+- **Library**: battle-tested, handles edge cases, saves time. **Cost:** bundle size, API lock-in, another dependency to keep updated.
+
+**How I'd answer:** I'd write my **own hook** for something small and app-specific (a toggle, a debounce) where a dependency isn't worth it. I'd pull in a **library** for anything with real edge cases — data fetching, forms, date handling — accepting the bundle and dependency cost because reinventing it correctly would cost more.
+
+### T21. TypeScript vs JavaScript in a React project
+- **TypeScript**: catches errors at compile time, self-documenting props, safer refactors. **Cost:** setup, build step, typing overhead, learning curve.
+- **JavaScript**: faster to start, no type ceremony. **Cost:** runtime type bugs, weaker editor help, riskier refactors.
+
+**How I'd answer:** I'd choose **TypeScript** for anything beyond a throwaway prototype or team project — the upfront typing cost pays off in fewer runtime bugs and safe refactors. I'd stick with **plain JavaScript** only for a quick prototype or tiny script where the setup overhead outweighs the safety.
+
+## More Next.js Trade-offs
+
+### T22. Middleware vs in-page auth checks
+- **Middleware**: runs at the edge before render, centralizes auth for many routes, fast redirects. **Cost:** limited runtime/APIs, no DB access, easy to over-scope with matchers.
+- **In-page/layout checks**: full server context, can hit the DB, fine-grained. **Cost:** repeated per page, page starts rendering before the check.
+
+**How I'd answer:** I'd use **middleware** for coarse, fast gatekeeping across a route group (redirect if no auth cookie), accepting its limited runtime. I'd add **in-page/layout checks** when I need the real session or DB-backed permissions, paying the per-page cost for accuracy. Often I'd combine both.
+
+### T23. Route Handlers vs a separate backend (Express/Nest)
+- **Route Handlers**: colocated with the frontend, one deploy, shared types. **Cost:** tied to Next's runtime/serverless model, less suited to heavy/long-running or stateful services.
+- **Separate backend**: full control, any language, long-running processes, mature ecosystem. **Cost:** another service to deploy, CORS, duplicated types.
+
+**How I'd answer:** I'd keep logic in **Route Handlers** for a typical full-stack app — one deploy and shared types outweigh the constraints. I'd stand up a **separate backend** when I need long-running jobs, websockets at scale, non-JS services, or a backend shared by multiple frontends, accepting the extra operational cost.
+
+### T24. Caching aggressively vs always-fresh data
+- **Aggressive caching** (SSG/ISR, cached fetch): fast, cheap, scalable. **Cost:** users may see stale data between revalidations.
+- **Always fresh** (`no-store`/SSR): correct up-to-the-second data. **Cost:** slower responses, more server load, higher cost.
+
+**How I'd answer:** I default to **caching aggressively** and tune the `revalidate` window to how fresh the data truly needs to be — accepting brief staleness for speed and cost. I'd switch to **always-fresh** only for data where correctness at read time is critical (prices, balances, inventory), knowing I pay in latency and server load.
+
+### T25. Edge runtime vs Node.js runtime
+- **Edge**: runs close to users, ultra-low latency, fast cold starts. **Cost:** limited APIs (no full Node), no native modules, small size limits.
+- **Node runtime**: full Node APIs, native deps, larger workloads. **Cost:** slower cold starts, runs from fewer regions.
+
+**How I'd answer:** I'd pick the **Edge runtime** for lightweight, latency-sensitive work like auth checks, redirects, and personalization in middleware — accepting the restricted API surface. I'd use the **Node runtime** when I need full Node APIs, native modules, or heavier compute, trading a bit of latency for capability.
 
 ---
 
